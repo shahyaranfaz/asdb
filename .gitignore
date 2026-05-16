@@ -14,3 +14,7 @@ target
 **/mutants.out*/
 
 .idea
+
+# Added by cargo
+
+/target
