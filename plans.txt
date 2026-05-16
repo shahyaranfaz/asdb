@@ -1,0 +1,349 @@
+================================================================
+asdb — Implementation Plan
+================================================================
+
+----------------------------------------------------------------
+PRINCIPLES
+----------------------------------------------------------------
+- Build bottom-up: nothing above depends on something unbuilt below
+- Every phase ends with something runnable and testable
+- Benchmark at the end of every phase, not just the end
+- Keep it compiling at all times — no broken main branches
+- Each milestone is a commit-worthy state
+
+----------------------------------------------------------------
+PHASE 1 — STORAGE ENGINE (Weeks 1-3)
+----------------------------------------------------------------
+Goal: read and write documents to disk reliably.
+
+  1.1  Page abstraction
+       - PAGE_SIZE = 4096 (match OS page size)
+       - Page struct: [u8; 4096]
+       - PageId: u64
+       - Serialize / deserialize raw bytes into/out of a Page
+       - Unit test: write known bytes, read back, assert identical
+
+  1.2  DiskManager
+       - Open / create a single database file
+       - read_page(page_id) -> Page
+       - write_page(page_id, page)
+       - allocate_page() -> PageId  (append new page, track count)
+       - free_page(page_id)         (free list, reuse on next alloc)
+       - Unit test: allocate 10k pages, write/read each, verify
+
+  1.3  BufferPool
+       - Fixed number of frames (configurable, default 1024 pages)
+       - Page table: HashMap<PageId, FrameId>
+       - LRU eviction: evict least recently used clean page first
+       - Dirty tracking: mark page dirty on write, flush on evict
+       - pin / unpin pages (pinned pages cannot be evicted)
+       - Unit test: fill buffer pool past capacity, verify eviction
+         and correct reads on re-fetch
+
+  1.4  Heap file (document storage)
+       - Slotted page layout:
+           [slot_count | slot_array | ... free space ... | records]
+       - insert_document(bytes) -> (PageId, SlotId)
+       - read_document(PageId, SlotId) -> bytes
+       - delete_document(PageId, SlotId)  (mark slot free)
+       - scan_all() -> iterator of all documents
+       - Unit test: insert 100k variable-length documents,
+         scan returns all, delete subset, scan reflects deletions
+
+  Phase 1 milestone:
+    Insert a raw byte blob, retrieve it by (PageId, SlotId),
+    restart the process, retrieve it again. Identical bytes.
+
+----------------------------------------------------------------
+PHASE 2 — DOCUMENT LAYER (Week 3-4)
+----------------------------------------------------------------
+Goal: structured documents on top of raw storage.
+
+  2.1  Document model
+       - Define Value enum: Int | Float | String | Bool | Null
+                                | Array(Vec<Value>)
+                                | Document(HashMap<String, Value>)
+       - Serialization: BSON-inspired binary format
+         (simpler than JSON, fixed-width numerics, length-prefixed strings)
+       - serialize(Document) -> Vec<u8>
+       - deserialize(bytes) -> Document
+       - Unit test: round-trip 10k random documents
+
+  2.2  Collection
+       - Named collection backed by a HeapFile
+       - Catalog entry: collection name → HeapFile root page
+       - insert(doc) -> DocId
+       - get(DocId) -> Document
+       - delete(DocId)
+       - scan() -> iterator<(DocId, Document)>
+
+  2.3  Catalog
+       - Persisted metadata on page 0 of the database file
+       - Tracks: collection names, root pages, schema if declared
+       - create_collection(name, optional schema)
+       - drop_collection(name)
+       - get_collection(name) -> Collection
+
+  Phase 2 milestone:
+    Programmatically insert 1M documents into a collection,
+    scan all back, verify count. Persist and restart, count unchanged.
+
+----------------------------------------------------------------
+PHASE 3 — B-TREE INDEX (Weeks 4-6)
+----------------------------------------------------------------
+Goal: fast point lookups and range scans on indexed fields.
+
+  3.1  BTreeNode
+       - Internal node: keys + child PageIds
+       - Leaf node: keys + DocIds + next-leaf pointer (linked list)
+       - All nodes are exactly one Page (4KB)
+       - Compute max keys per node for your key size
+       - Serialization to/from Page bytes
+
+  3.2  BTree operations
+       - search(key) -> Option<DocId>
+       - insert(key, DocId)
+       - delete(key)
+       - range_scan(low, high) -> iterator<DocId>
+       - Handle node splits on insert
+       - Handle underflow / merge / redistribute on delete
+
+  3.3  Index integration
+       - IndexManager: collection + field -> BTree root PageId
+       - Auto-update index on collection insert/delete
+       - create_index(collection, field)
+       - drop_index(collection, field)
+
+  3.4  Benchmarks (run on teach.cs)
+       - Insert 10M keys sequential vs random order
+       - Point lookup: 1M random lookups, measure p50/p95/p99 latency
+       - Range scan: varying selectivity (0.1%, 1%, 10% of collection)
+       - Compare: indexed lookup vs sequential scan crossover point
+       - Observe buffer pool pressure: pool sized at 10%, 50%, 100%
+         of working set — record how eviction affects throughput
+
+  Phase 3 milestone:
+    create index on users.age
+    Insert 1M users with random ages
+    Range scan age 20-30 returns correct DocIds in order
+    Point lookup faster than sequential scan at >1k documents
+
+----------------------------------------------------------------
+PHASE 4 — LEXER + PARSER (Weeks 6-7)
+----------------------------------------------------------------
+Goal: tokenize and parse ASL queries into an AST.
+
+  4.1  Token definitions
+       - Keywords: from, where, select, order, limit, offset,
+                   group, join, insert, update, delete, drop,
+                   create, index, on, set, as, in, exists,
+                   missing, contains, starts, ends, use,
+                   asc, desc, and, or, not, if, then, else,
+                   true, false, null, required, unique, any
+       - Literals: IntLit, FloatLit, StringLit
+       - Identifiers: unquoted field/collection names
+       - Operators: == != > >= < <= + - * / % |
+       - Punctuation: { } [ ] ( ) , :
+
+  4.2  Lexer
+       - Input: &str
+       - Output: Vec<Token>
+       - Hand-rolled, no external crates
+       - Handle whitespace, comments (--)
+       - Unit test: lex 50 representative ASL queries,
+         assert token streams are correct
+
+  4.3  AST definitions
+       - Pipeline: Vec<Stage>
+       - Stage enum:
+           From { collection, index_hint }
+           Where { expr: Expr }
+           Select { fields: Vec<Projection> }
+           Drop { fields }
+           Order { keys: Vec<(field, direction)> }
+           Limit { n }
+           Offset { n }
+           Group { fields }
+           Join { collection, left_field, right_field }
+           Insert { documents }
+           Update { assignments }
+           Delete
+       - Expr enum: (recursive)
+           Field(name)
+           Lit(Value)
+           BinOp(op, Box<Expr>, Box<Expr>)
+           UnaryOp(op, Box<Expr>)
+           In(field, Vec<Value>)
+           Exists(field)
+           Contains / Starts / Ends
+           Ternary(Box<Expr>, Box<Expr>, Box<Expr>)
+
+  4.4  Parser
+       - Input: Vec<Token>
+       - Output: Pipeline (Vec<Stage>)
+       - Split on Pipe token first → parse each segment independently
+       - Recursive descent for expr parsing within where/select/update
+       - Unit test: parse 50 queries end to end,
+         assert AST shape is correct for each
+
+  Phase 4 milestone:
+    Parse this query without error, assert correct AST:
+      from users | where age > 18 and country == "CA"
+                 | order name asc
+                 | select name, email
+                 | limit 25
+
+----------------------------------------------------------------
+PHASE 5 — QUERY ENGINE (Weeks 7-9)
+----------------------------------------------------------------
+Goal: execute parsed pipelines against real data.
+
+  5.1  Binder
+       - Resolve field names against catalog schemas
+       - Type-check expressions where schema is known
+       - Reject queries referencing nonexistent collections
+       - Produce a bound pipeline (field refs resolved to types)
+
+  5.2  Planner
+       - Bound pipeline → physical plan
+       - Physical operators:
+           SeqScan        (full collection scan)
+           IndexScan      (B-tree range/point scan)
+           Filter         (apply where expr)
+           Projection     (select / drop)
+           Sort           (order by — external sort if needed)
+           Limit / Offset
+           HashAggregate  (group + aggregate functions)
+           HashJoin       (join stage)
+           Insert / Update / Delete
+       - Simple rule: if index exists on where field, use IndexScan
+         else SeqScan. No cost model in v1.
+
+  5.3  Executor — Volcano iterator model
+       - Trait: Iterator<Item = Document>
+       - Each operator implements open() / next() / close()
+       - Pipeline is a tree of iterators, pull from root
+       - Execution is lazy and streaming — no materializing
+         the full result set in memory unless required (sort, group)
+
+  5.4  Expression evaluator
+       - eval(expr, document) -> Value
+       - Handle all Expr variants
+       - Type coercion: int + float -> float, etc.
+
+  5.5  Mutation execution
+       - Insert: deserialize document literal, call collection.insert
+       - Update: scan matching docs, apply set assignments, re-write
+       - Delete: scan matching docs, call collection.delete
+
+  Phase 5 milestone:
+    End to end — the full asdb demo:
+
+      create users { id: int required unique, name: string, age: int }
+      create index on users.id
+      from users | insert { id: 1, name: "alice", age: 25 }
+      from users | insert { id: 2, name: "bob", age: 17 }
+      from users | where age >= 18 | select name, age
+        → [{ name: "alice", age: 25 }]
+
+    Restart process. Query again. Same result.
+
+----------------------------------------------------------------
+PHASE 6 — INTERFACE + POLISH (Week 9-10)
+----------------------------------------------------------------
+Goal: something you can actually demo and put on GitHub.
+
+  6.1  REPL
+       - Read a line, execute as ASL pipeline, print result
+       - Multi-line input (trailing | continues to next line)
+       - .help, .collections, .schema <name>, .quit commands
+       - Pretty-print document results as a table
+
+  6.2  File execution
+       asdb run query.asl
+       - Read ASL from file, execute, print results
+
+  6.3  CLI
+       asdb repl              start interactive shell
+       asdb run <file>        execute ASL file
+       asdb bench             run built-in benchmark suite
+       asdb info              print catalog / stats
+
+  6.4  Error messages
+       - Every error includes: what went wrong, which stage, why
+       - No panics in normal operation — all errors are Result<>
+
+  6.5  README
+       - What asdb is
+       - ASL by example — 10 representative queries
+       - Architecture overview (the 5 phases as a diagram)
+       - Benchmark results from teach.cs
+         (insert throughput, lookup latency p50/p95/p99,
+          range scan at varying selectivities,
+          buffer pool pressure curves)
+
+----------------------------------------------------------------
+BENCHMARKS — TEACH.CS TARGETS
+----------------------------------------------------------------
+Run on EPYC server via teach.cs access.
+Use numactl to pin and observe NUMA effects.
+
+  B1  Insert throughput
+      - Sequential insert: 1M, 5M, 10M documents
+      - Random insert: same sizes
+      - Measure: docs/sec, wall time
+
+  B2  Point lookup latency
+      - Indexed vs non-indexed
+      - 1M random lookups on 10M document collection
+      - Measure: p50, p95, p99 latency
+
+  B3  Range scan selectivity
+      - 0.1%, 1%, 10%, 50% of collection
+      - Indexed range vs sequential scan
+      - Find crossover point where seq scan wins
+
+  B4  Buffer pool pressure
+      - Fix buffer pool at 10% / 25% / 50% / 100% of working set
+      - Measure throughput degradation curve
+      - Observe: eviction rate, dirty page flush frequency
+
+  B5  Write amplification
+      - Measure actual bytes written to disk vs logical bytes inserted
+      - At 1M, 5M, 10M documents with and without index
+
+----------------------------------------------------------------
+OUT OF SCOPE — v1
+----------------------------------------------------------------
+  - WAL / crash recovery / transactions
+  - Outer joins
+  - Subqueries / nested pipelines
+  - Query optimizer with cost model
+  - Concurrent access / locking
+  - Replication / distribution
+  - Auth / permissions
+  - Network protocol / server mode
+
+These are v2 starting points, not failures of v1.
+
+----------------------------------------------------------------
+STRETCH GOALS (if time allows)
+----------------------------------------------------------------
+  - WAL: append-only log, replay on crash recovery
+  - Server mode: TCP socket, send ASL queries over the wire
+  - Simple cost-based optimizer: use index selectivity estimates
+  - NUMA-aware buffer pool: allocate frames on local NUMA node
+
+----------------------------------------------------------------
+SUGGESTED CRATES
+----------------------------------------------------------------
+  - none required for core engine (intentional)
+  - serde_json: only for result output formatting
+  - clap: CLI argument parsing
+  - rustyline: REPL line editing (readline-style)
+
+Everything else — storage, B-tree, parser, executor — hand-rolled.
+
+================================================================
+END OF PLAN v0.1
+================================================================

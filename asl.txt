@@ -1,0 +1,322 @@
+================================================================
+ASL — Ave-Shay Language
+Query Language Specification v0.1
+asdb
+================================================================
+
+----------------------------------------------------------------
+OVERVIEW
+----------------------------------------------------------------
+ASL is a pipe-oriented query language for asdb. Queries are
+composed of discrete stages separated by the pipe operator (|).
+Each stage transforms a stream of documents and passes it to
+the next. Execution is left-to-right, lazy, iterator-based.
+
+A query is a pipeline:
+    <source> | <stage> | <stage> | ...
+
+----------------------------------------------------------------
+SYNTAX CONVENTIONS
+----------------------------------------------------------------
+- Keywords are lowercase
+- Field names are unquoted identifiers
+- String literals are double-quoted: "alice"
+- Numbers are unquoted: 42, 3.14
+- Booleans: true, false
+- Null: null
+- Comments: -- this is a comment
+
+----------------------------------------------------------------
+DATA MODEL
+----------------------------------------------------------------
+shaydb stores collections of documents.
+A document is a set of key-value pairs.
+Values can be:
+    - Int        64-bit signed integer
+    - Float      64-bit float
+    - String     UTF-8 text
+    - Bool       true | false
+    - Null       null
+    - Array      [val, val, ...]
+    - Document   { key: val, key: val, ... }  (nested)
+
+----------------------------------------------------------------
+SOURCE STAGES
+----------------------------------------------------------------
+Every pipeline must begin with exactly one source stage.
+
+    from <collection>
+        Scans all documents in a collection.
+        Example:
+            from users
+
+    from <collection> use index <field>
+        Hints the executor to use an index on <field>.
+        Example:
+            from users use index age
+
+----------------------------------------------------------------
+FILTER STAGE
+----------------------------------------------------------------
+    where <expr>
+        Retains documents where <expr> evaluates to true.
+        Discards all others.
+
+    Comparison operators:
+        ==   equal
+        !=   not equal
+        >    greater than
+        >=   greater than or equal
+        <    less than
+        <=   less than or equal
+
+    Logical operators:
+        and, or, not
+
+    Membership:
+        <field> in [val, val, ...]
+        <field> not in [val, val, ...]
+
+    Existence:
+        exists <field>       document has this field
+        missing <field>      document does not have this field
+
+    String matching:
+        <field> contains "substr"
+        <field> starts "prefix"
+        <field> ends "suffix"
+
+    Examples:
+        from users | where age > 18
+        from users | where age > 18 and country == "CA"
+        from users | where name contains "ali"
+        from orders | where status in ["pending", "shipped"]
+        from logs | where exists error_code
+
+----------------------------------------------------------------
+PROJECTION STAGE
+----------------------------------------------------------------
+    select <field>, <field>, ...
+        Emits only the specified fields from each document.
+        Example:
+            from users | select name, email
+
+    select *
+        Emits all fields. Default if select is omitted.
+
+    select <field> as <alias>, ...
+        Renames a field in the output.
+        Example:
+            from users | select name, age as years
+
+    drop <field>, <field>, ...
+        Emits all fields except those listed.
+        Example:
+            from users | drop password, internal_id
+
+----------------------------------------------------------------
+SORTING STAGE
+----------------------------------------------------------------
+    order <field> asc
+    order <field> desc
+    order <field> asc, <field> desc   (multi-key)
+
+    Examples:
+        from users | order age desc
+        from users | order country asc, age desc
+
+----------------------------------------------------------------
+PAGINATION STAGES
+----------------------------------------------------------------
+    limit <n>
+        Emits at most n documents.
+        Example:
+            from users | limit 10
+
+    offset <n>
+        Skips the first n documents.
+        Example:
+            from users | offset 20 | limit 10
+
+    Canonical pagination pattern:
+        from users | order id asc | offset 100 | limit 25
+
+----------------------------------------------------------------
+AGGREGATION STAGES
+----------------------------------------------------------------
+    group <field>
+        Groups documents by the value of <field>.
+        Must be followed by an aggregate select.
+
+    group <field>, <field>, ...
+        Groups by composite key.
+
+    Aggregate functions (used inside select after group):
+        count           number of documents in group
+        sum <field>     sum of field values
+        avg <field>     average of field values
+        min <field>     minimum field value
+        max <field>     maximum field value
+        collect <field> array of all values in group
+
+    Examples:
+        from orders | group status | select status, count
+        from orders | group user_id | select user_id, sum total
+        from users  | group country | select country, count, avg age
+
+----------------------------------------------------------------
+MUTATION STAGES
+----------------------------------------------------------------
+Mutation pipelines source from a collection and terminate in
+a mutation stage. They do not return document streams — they
+return a result summary { affected: n }.
+
+    insert { key: val, key: val, ... }
+        Inserts a single document into the source collection.
+        Example:
+            from users | insert { name: "alice", age: 25 }
+
+    insert [ { ... }, { ... }, ... ]
+        Batch insert.
+        Example:
+            from users | insert [{ name: "bob" }, { name: "carol" }]
+
+    update set <field> = <val>, ...
+        Updates matching documents. Combine with where.
+        Example:
+            from users | where id == 1 | update set age = 26
+
+    update set <field> = <field> + <val>
+        Field expression update.
+        Example:
+            from orders | where status == "pending" | update set retries = retries + 1
+
+    delete
+        Deletes all documents passing through the pipeline.
+        Example:
+            from users | where age < 0 | delete
+
+----------------------------------------------------------------
+JOIN STAGE
+----------------------------------------------------------------
+    join <collection> on <left_field> == <right_field>
+        Hash join. Matches documents from the left stream
+        with documents from the right collection.
+        Example:
+            from orders | join users on user_id == id | select name, total
+
+    join type defaults to inner. Outer joins are out of scope for v1.
+
+----------------------------------------------------------------
+FIELD EXPRESSIONS
+----------------------------------------------------------------
+Field expressions can appear in where, select, update set,
+and order stages.
+
+    Arithmetic:     +  -  *  /  %
+    String concat:  field + " suffix"
+    Ternary:        if <expr> then <val> else <val>
+
+    Examples:
+        from products | select name, price * 1.13 as price_with_tax
+        from users | select name, if age >= 18 then "adult" else "minor" as group
+
+----------------------------------------------------------------
+SCHEMA DEFINITION
+----------------------------------------------------------------
+Collections are created with a schema declaration.
+Schema is optional — schemaless documents are permitted —
+but declared fields are indexable and type-checked on insert.
+
+    create <collection> { <field>: <type>, ... }
+
+    Types:
+        int, float, string, bool, any
+
+    Constraints (optional, inline):
+        required    field must be present on insert
+        unique      enforce uniqueness via index
+
+    Examples:
+        create users { id: int required unique, name: string required, age: int }
+        create logs  { timestamp: int required, message: string, level: string }
+
+    Drop a collection:
+        drop collection <name>
+
+----------------------------------------------------------------
+INDEX DEFINITION
+----------------------------------------------------------------
+    create index on <collection>.<field>
+    create index on <collection>.<field>, <field>   (composite)
+    drop index on <collection>.<field>
+
+    Examples:
+        create index on users.id
+        create index on orders.user_id, orders.status
+
+----------------------------------------------------------------
+RESULT FORMAT
+----------------------------------------------------------------
+Query pipelines return a document stream serialized as:
+
+    {
+      "count": <n>,
+      "documents": [ { ... }, { ... }, ... ]
+    }
+
+Mutation pipelines return:
+
+    {
+      "affected": <n>
+    }
+
+Error responses:
+
+    {
+      "error": "<message>",
+      "stage": "<stage where error occurred>"
+    }
+
+----------------------------------------------------------------
+EXAMPLES — FULL QUERIES
+----------------------------------------------------------------
+
+-- All adult users in Canada, sorted by name
+from users | where age >= 18 and country == "CA" | order name asc | select name, email
+
+-- Paginate products by price descending
+from products | order price desc | offset 0 | limit 25 | select name, price
+
+-- Order summary per user
+from orders | group user_id | select user_id, count, sum total | order sum desc
+
+-- Join orders with users
+from orders | where status == "shipped" | join users on user_id == id | select name, total, shipped_at
+
+-- Insert a document
+from users | insert { name: "alice", age: 25, country: "CA" }
+
+-- Update a field
+from users | where id == 42 | update set age = 26
+
+-- Delete stale sessions
+from sessions | where expires < 1700000000 | delete
+
+-- Schemaless insert (no schema required)
+from events | insert { type: "click", element: "btn-signup", ts: 1700000000 }
+
+----------------------------------------------------------------
+OUT OF SCOPE — v1
+----------------------------------------------------------------
+- Transactions / multi-statement atomicity
+- Subqueries
+- Outer joins
+- Window functions
+- Full-text search
+- User permissions / auth
+- Replication
+
+================================================================
+END OF SPEC v0.1
+================================================================
