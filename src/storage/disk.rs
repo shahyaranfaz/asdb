@@ -11,7 +11,7 @@ is only callable when that trait is in scope. so importing them is what turns on
 the dot-method syntax we use below.
 */
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 // `crate::` means "from the root of this crate". this is how we reach into our own modules.
 use crate::storage::page::{Page, PageId, PAGE_SIZE};
@@ -65,7 +65,14 @@ impl DiskManager {
             .create(true)
             .open(path)?;
 
-        let num_pages = file.metadata()?.len() / PAGE_SIZE as u64;
+        let file_len = file.metadata()?.len();
+        if file_len % PAGE_SIZE as u64 != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "database file length is not page-aligned",
+            ));
+        }
+        let num_pages = file_len / PAGE_SIZE as u64;
 
         // free_list starts empty. note: this means freed pages from previous
         // sessions are forgotten and effectively leaked. that's a v1 trade-off.
@@ -174,9 +181,16 @@ impl DiskManager {
     free list, usually a linked list of free pages where each free page itself
     stores the id of the next free page.
     */
-    pub fn free_page(&mut self, page_id: PageId) {
+    pub fn free_page(&mut self, page_id: PageId) -> std::io::Result<()> {
         assert!(page_id < self.num_pages, "page_id out of range");
+        if self.free_list.contains(&page_id) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "page is already free",
+            ));
+        }
         self.free_list.push(page_id);
+        Ok(())
     }
 
     /*
@@ -259,7 +273,7 @@ mod tests {
         dirty.data[0] = 0xAB;
         dm.write_page(p0, &dirty).unwrap();
 
-        dm.free_page(p0);
+        dm.free_page(p0).unwrap();
 
         // next allocate should hand back p0 (LIFO), not p2
         let reused = dm.allocate_page().unwrap();
@@ -267,5 +281,61 @@ mod tests {
 
         let fresh = dm.read_page(reused).unwrap();
         assert_eq!(fresh.data[0], 0, "reused page should be zeroed");
+    }
+
+    #[test]
+    fn test_rejects_partial_page_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(PAGE_SIZE as u64 + 1).unwrap();
+
+        let err = match DiskManager::open(tmp.path()) {
+            Ok(_) => panic!("expected partial page file to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_double_free_is_error() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut dm = DiskManager::open(tmp.path()).unwrap();
+        let page_id = dm.allocate_page().unwrap();
+
+        dm.free_page(page_id).unwrap();
+        let err = dm.free_page(page_id).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    #[ignore = "phase 1 stress test: writes and verifies 10k pages"]
+    fn stress_allocate_10k_pages_write_read_each() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut dm = DiskManager::open(tmp.path()).unwrap();
+        let mut ids = Vec::with_capacity(10_000);
+
+        for i in 0..10_000u64 {
+            let page_id = dm.allocate_page().unwrap();
+            assert_eq!(page_id, i);
+
+            let mut page = Page::new();
+            page.data[0..8].copy_from_slice(&i.to_le_bytes());
+            page.data[PAGE_SIZE - 8..PAGE_SIZE].copy_from_slice(&(!i).to_le_bytes());
+            page.data[123] = (i & 0xff) as u8;
+            dm.write_page(page_id, &page).unwrap();
+            ids.push(page_id);
+        }
+
+        assert_eq!(dm.num_pages(), 10_000);
+
+        for (i, page_id) in ids.into_iter().enumerate() {
+            let page = dm.read_page(page_id).unwrap();
+            let i = i as u64;
+            assert_eq!(u64::from_le_bytes(page.data[0..8].try_into().unwrap()), i);
+            assert_eq!(
+                u64::from_le_bytes(page.data[PAGE_SIZE - 8..PAGE_SIZE].try_into().unwrap()),
+                !i
+            );
+            assert_eq!(page.data[123], (i & 0xff) as u8);
+        }
     }
 }

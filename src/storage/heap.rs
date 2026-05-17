@@ -136,6 +136,7 @@ impl HeapFile {
     avoid an extra disk flush on a full tail is a good trade.
     */
     pub fn insert(&mut self, data: &[u8]) -> std::io::Result<DocId> {
+        assert!(!data.is_empty(), "empty records are not supported");
         assert!(
             data.len() <= MAX_RECORD_SIZE,
             "record larger than MAX_RECORD_SIZE"
@@ -393,6 +394,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "empty records are not supported")]
+    fn test_insert_empty_record_panics() {
+        let (mut heap, _tmp) = make_heap(4);
+        heap.insert(b"").unwrap();
+    }
+
+    #[test]
     fn test_insert_many_single_page() {
         let (mut heap, _tmp) = make_heap(4);
         let mut ids = Vec::new();
@@ -509,5 +517,42 @@ mod tests {
         let alive = heap.scan_all().unwrap();
         let expected_alive = ids.iter().enumerate().filter(|(i, _)| i % 7 != 0).count();
         assert_eq!(alive.len(), expected_alive);
+    }
+
+    #[test]
+    #[ignore = "phase 1 stress test: inserts 100k variable-length records"]
+    fn stress_insert_100k_variable_records_delete_subset_scan() {
+        let (mut heap, _tmp) = make_heap(128);
+        let mut ids = Vec::with_capacity(100_000);
+
+        for i in 0u32..100_000 {
+            let payload = stress_payload(i);
+            let id = heap.insert(&payload).unwrap();
+            ids.push((id, payload));
+        }
+
+        for (idx, (id, _)) in ids.iter().enumerate() {
+            if idx % 7 == 0 {
+                heap.delete(*id).unwrap();
+            }
+        }
+
+        let alive = heap.scan_all().unwrap();
+        let expected_alive = ids.iter().enumerate().filter(|(i, _)| i % 7 != 0).count();
+        assert_eq!(alive.len(), expected_alive);
+
+        for (idx, (id, expected)) in ids.iter().enumerate().step_by(997) {
+            let got = heap.read(*id).unwrap();
+            if idx % 7 == 0 {
+                assert_eq!(got, None);
+            } else {
+                assert_eq!(got.as_deref(), Some(expected.as_slice()));
+            }
+        }
+    }
+
+    fn stress_payload(i: u32) -> Vec<u8> {
+        let len = 1 + (i as usize % 200);
+        (0..len).map(|j| ((i.wrapping_mul(31) + j as u32) & 0xff) as u8).collect()
     }
 }

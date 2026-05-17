@@ -185,8 +185,7 @@ impl BufferPool {
             self.frames[idx].last_used = 0;
             self.page_table.remove(&page_id);
         }
-        self.disk.free_page(page_id);
-        Ok(())
+        self.disk.free_page(page_id)
     }
 
     /*
