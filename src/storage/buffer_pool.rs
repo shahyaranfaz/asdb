@@ -20,7 +20,7 @@ use crate::storage::disk::DiskManager;
 use crate::storage::page::{Page, PageId};
 
 /*
-Frame : one slot in the buffer pool.
+Frame: one slot in the buffer pool.
 
 page_id is Option<PageId> because a frame can be empty (no page loaded yet).
 this matters when the pool is first created or after we explicitly invalidate.
@@ -47,7 +47,7 @@ impl Frame {
 }
 
 /*
-BufferPool : owns the DiskManager and a fixed Vec of frames.
+BufferPool: owns the DiskManager and a fixed Vec of frames.
 
 note we OWN the DiskManager. this is a phase 1 simplification. later, multiple
 heap files / btrees will share one buffer pool, and the buffer pool will still
@@ -67,7 +67,7 @@ pub struct BufferPool {
 
 impl BufferPool {
     /*
-    new : build a pool of `capacity` frames around a DiskManager.
+    new: build a pool of `capacity` frames around a DiskManager.
 
     `(0..capacity).map(|_| Frame::empty()).collect()` is the iterator way to
     build a Vec of N things. you could also write a for loop with push, but the
@@ -88,7 +88,7 @@ impl BufferPool {
     }
 
     /*
-    with_page : pin a page, run the closure with a read-only view, unpin.
+    with_page: pin a page, run the closure with a read-only view, unpin.
 
     this is the api callers use to read a page through the buffer pool. why a
     closure instead of returning `&Page`? because if we returned a reference,
@@ -125,7 +125,7 @@ impl BufferPool {
     }
 
     /*
-    with_page_mut : same as with_page but hands a &mut Page and marks dirty.
+    with_page_mut: same as with_page but hands a &mut Page and marks dirty.
 
     we mark dirty unconditionally even if the closure didn't actually mutate.
     that means we might re-flush an unchanged page (wasted disk io) but never
@@ -148,7 +148,7 @@ impl BufferPool {
     }
 
     /*
-    new_page : allocate a fresh page on disk, load an empty frame for it, run
+    new_page: allocate a fresh page on disk, load an empty frame for it, run
     the closure to initialize it, return (page_id, R).
 
     the closure can fill in headers, write initial data, whatever. the page is
@@ -171,7 +171,7 @@ impl BufferPool {
     }
 
     /*
-    delete_page : drop a page from the pool and free it on disk.
+    delete_page: drop a page from the pool and free it on disk.
 
     asserts no one is currently using it (pin_count == 0). if you panic here,
     you have a bug: you're freeing a page someone else is reading.
@@ -189,7 +189,7 @@ impl BufferPool {
     }
 
     /*
-    flush_all : write every dirty frame back to disk.
+    flush_all: write every dirty frame back to disk.
 
     call this before shutdown (or before a checkpoint, when we add those). a
     crash between flush_all calls would lose any dirty pages that hadn't been
@@ -215,7 +215,7 @@ impl BufferPool {
     }
 
     /*
-    capacity : how many frames the pool has total.
+    capacity: how many frames the pool has total.
     used by tests, mostly. trivial getter.
     */
     pub fn capacity(&self) -> usize {
@@ -225,7 +225,7 @@ impl BufferPool {
     // ----- internals below -----
 
     /*
-    fetch_or_load : returns the index of the frame that holds page_id, loading
+    fetch_or_load: returns the index of the frame that holds page_id, loading
     it from disk if it isn't already cached.
 
     note we don't pin here. pinning happens in the with_page methods. this
@@ -241,7 +241,7 @@ impl BufferPool {
     }
 
     /*
-    allocate_frame : find an empty frame or evict the LRU unpinned frame, then
+    allocate_frame: find an empty frame or evict the LRU unpinned frame, then
     register the new page_id in the page table.
 
     two passes:
@@ -294,7 +294,7 @@ impl BufferPool {
     }
 
     /*
-    touch : bump the LRU counter on a frame.
+    touch: bump the LRU counter on a frame.
 
     the clock just keeps incrementing. with u64 it overflows after 18
     quintillion accesses, which is "never" in practice. if we ever ran that
@@ -307,7 +307,7 @@ impl BufferPool {
 }
 
 /*
-Drop : when a BufferPool goes out of scope, flush any dirty pages.
+Drop: when a BufferPool goes out of scope, flush any dirty pages.
 
 implementing the Drop trait is rust's version of a destructor, runs
 automatically when the value is dropped. perfect place to make sure no dirty

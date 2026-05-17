@@ -1,12 +1,12 @@
 /*
-heap.rs : variable-length records stored in a chain of slotted pages.
+heap.rs: variable-length records stored in a chain of slotted pages.
 
 PAGE LAYOUT (each page in the chain looks like this)
 
-  byte 0..8       next_page_id : u64  (NO_NEXT sentinel if this is the tail)
-  byte 8..10      slot_count   : u16  (number of slots, including tombstones)
-  byte 10..12     free_end     : u16  (records grow down from free_end)
-  byte 12..       slot_array   : slot[slot_count]
+  byte 0..8       next_page_id: u64  (NO_NEXT sentinel if this is the tail)
+  byte 8..10      slot_count  : u16  (number of slots, including tombstones)
+  byte 10..12     free_end    : u16  (records grow down from free_end)
+  byte 12..       slot_array  : slot[slot_count]
                                   each slot = [offset: u16, length: u16]
                                   length == 0 means the slot was deleted (tombstone)
   free space in the middle
@@ -48,7 +48,7 @@ const HEADER_SIZE: usize = 12;
 const SLOT_SIZE: usize = 4;
 
 /*
-NO_NEXT : sentinel meaning "this is the last page in the chain".
+NO_NEXT: sentinel meaning "this is the last page in the chain".
 
 we can't use 0 because page 0 is a valid page id in v1. u64::MAX is safe,
 we will never have that many pages. (4096 bytes * u64::MAX is more than
@@ -66,7 +66,7 @@ expression works fine since all inputs are const.
 pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 
 /*
-HeapFile : a chain of slotted pages anchored at `root`, with `last_page`
+HeapFile: a chain of slotted pages anchored at `root`, with `last_page`
 cached for O(1) appends.
 
 owns its BufferPool for v1. when phase 2 introduces collections (multiple
@@ -89,7 +89,7 @@ pub struct HeapFile {
 
 impl HeapFile {
     /*
-    create : allocate the root page, initialize it as an empty heap page,
+    create: allocate the root page, initialize it as an empty heap page,
     return a fresh HeapFile.
 
     `bp.new_page(...)` returns (PageId, R) where R is whatever the closure
@@ -101,7 +101,7 @@ impl HeapFile {
     }
 
     /*
-    open : attach to an existing heap whose root page id we already know.
+    open: attach to an existing heap whose root page id we already know.
 
     we walk the chain once on open to find the tail page so future inserts
     are O(1). that walk is O(n in pages), but it happens once at startup,
@@ -121,7 +121,7 @@ impl HeapFile {
     }
 
     /*
-    insert : append a record to the tail page, return its DocId.
+    insert: append a record to the tail page, return its DocId.
 
     fast path:
       check if last_page has room. if yes, insert there.
@@ -166,7 +166,7 @@ impl HeapFile {
     }
 
     /*
-    read : fetch a record by DocId, or None if the slot is a tombstone.
+    read: fetch a record by DocId, or None if the slot is a tombstone.
 
     returns Vec<u8> (owned copy) rather than &[u8] because we can't hand
     out a reference into a buffer pool frame across function boundaries
@@ -178,7 +178,7 @@ impl HeapFile {
     }
 
     /*
-    delete : tombstone a slot. the underlying bytes stay until a future
+    delete: tombstone a slot. the underlying bytes stay until a future
     compaction (not implemented in v1).
 
     if the slot is already a tombstone, this is a no-op.
@@ -191,7 +191,7 @@ impl HeapFile {
     }
 
     /*
-    scan_all : walk the whole chain and return every live (DocId, bytes) pair.
+    scan_all: walk the whole chain and return every live (DocId, bytes) pair.
 
     Vec<(DocId, Vec<u8>)> materializes the whole thing in memory. fine for
     v1 and for tests. phase 5 will swap this for a streaming iterator
@@ -223,7 +223,7 @@ impl HeapFile {
     }
 
     /*
-    flush : push all dirty frames to disk. call before drop if you want
+    flush: push all dirty frames to disk. call before drop if you want
     explicit error handling (Drop in BufferPool swallows errors).
     */
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -242,7 +242,7 @@ we pass to bp.with_page* without borrow-checker drama.
 */
 
 /*
-find_last_page : walk the chain from `root` until next == NO_NEXT,
+find_last_page: walk the chain from `root` until next == NO_NEXT,
 return that page id. called once on open.
 */
 fn find_last_page(bp: &mut BufferPool, root: PageId) -> std::io::Result<PageId> {
@@ -257,7 +257,7 @@ fn find_last_page(bp: &mut BufferPool, root: PageId) -> std::io::Result<PageId> 
 }
 
 /*
-init_heap_page : write the empty heap page header.
+init_heap_page: write the empty heap page header.
 called on every freshly-allocated page in a heap file chain.
 */
 fn init_heap_page(page: &mut Page) {
@@ -267,7 +267,7 @@ fn init_heap_page(page: &mut Page) {
 }
 
 /*
-page_free_space : bytes available between the slot array (growing up) and
+page_free_space: bytes available between the slot array (growing up) and
 the record area (growing down).
 
 if the two have crossed (shouldn't happen with correct accounting),
@@ -282,7 +282,7 @@ fn page_free_space(page: &Page) -> usize {
 }
 
 /*
-try_insert_in_page : append a new record + slot, return the new slot id.
+try_insert_in_page: append a new record + slot, return the new slot id.
 returns None if the record + slot won't fit.
 
 the slot id is just the index of the slot in the slot array, which is
@@ -313,7 +313,7 @@ fn try_insert_in_page(page: &mut Page, data: &[u8]) -> Option<SlotId> {
 }
 
 /*
-read_slot : pull the record bytes for `slot_id`, or None if tombstoned
+read_slot: pull the record bytes for `slot_id`, or None if tombstoned
 or out of range.
 */
 fn read_slot(page: &Page, slot_id: SlotId) -> Option<Vec<u8>> {
@@ -331,7 +331,7 @@ fn read_slot(page: &Page, slot_id: SlotId) -> Option<Vec<u8>> {
 }
 
 /*
-tombstone_slot : mark a slot as deleted by zeroing its length.
+tombstone_slot: mark a slot as deleted by zeroing its length.
 silently no-ops on out-of-range or already-tombstoned slots.
 */
 fn tombstone_slot(page: &mut Page, slot_id: SlotId) {

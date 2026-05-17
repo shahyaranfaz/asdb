@@ -7,7 +7,7 @@ pub struct Page {
     pub data: [u8; PAGE_SIZE],
 }
 /* 
-impl page : methods to add to struct
+impl page: methods to add to struct
 */
 impl Page {
     pub fn new() -> Self {

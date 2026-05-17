@@ -17,7 +17,7 @@ use std::path::Path;
 use crate::storage::page::{Page, PageId, PAGE_SIZE};
 
 /*
-DiskManager : owns one file on disk and tracks how many pages live in it.
+DiskManager: owns one file on disk and tracks how many pages live in it.
 
 the database is one big file. every PAGE_SIZE (4096) bytes is one page. page_id
 is just the index of the page (page 0 is bytes 0..4096, page 1 is 4096..8192).
@@ -39,7 +39,7 @@ pub struct DiskManager {
 
 impl DiskManager {
     /*
-    open : open or create the db file.
+    open: open or create the db file.
 
     std::io::Result<Self> is sugar for Result<Self, std::io::Error>. rust has no
     exceptions, errors are values. every fallible call returns Result and you
@@ -80,7 +80,7 @@ impl DiskManager {
     }
 
     /*
-    read_page : pull one page off disk by its id.
+    read_page: pull one page off disk by its id.
 
     why &mut self and not &self? because seeking moves the file cursor, which is
     state inside the File. any method that mutates the receiver needs &mut. the
@@ -109,7 +109,7 @@ impl DiskManager {
     }
 
     /*
-    write_page : overwrite one page on disk.
+    write_page: overwrite one page on disk.
 
     `page: &Page` is a shared (immutable) borrow. we don't need to mutate the
     page, we just need to read its bytes. compare with &mut self above. one
@@ -134,7 +134,7 @@ impl DiskManager {
     }
 
     /*
-    allocate_page : reuse a freed page if any, else append a fresh zeroed one.
+    allocate_page: reuse a freed page if any, else append a fresh zeroed one.
 
     flow:
       1. if free_list has an id, pop it, zero the page on disk, hand it back.
@@ -171,7 +171,7 @@ impl DiskManager {
     }
 
     /*
-    free_page : mark a page as recyclable.
+    free_page: mark a page as recyclable.
 
     we don't touch the bytes on disk, we just remember the id. the next
     allocate_page call will pop it back out and zero it then.
@@ -194,7 +194,7 @@ impl DiskManager {
     }
 
     /*
-    num_pages : read-only accessor.
+    num_pages: read-only accessor.
 
     &self (no mut) because we're only reading. returning u64 by value is fine,
     integers are Copy so this is just a register move, no borrow drama.
@@ -208,13 +208,13 @@ impl DiskManager {
 }
 
 /*
-#[cfg(test)] : conditional compilation attribute.
+#[cfg(test)]: conditional compilation attribute.
 
 this whole module only gets compiled when you run `cargo test`. in release
 builds it doesn't exist, so test code adds zero bytes to your binary. this is
 a really nice pattern, tests sit next to the code they test.
 
-`mod tests { use super::*; }` : tests is a child module. `super` means "one
+`mod tests { use super::*; }`: tests is a child module. `super` means "one
 module up", so super::* pulls in everything from disk.rs into the test scope.
 that's how the tests get access to DiskManager without re-importing it.
 */
@@ -228,7 +228,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     /*
-    #[test] : marks this fn as a test case. cargo test discovers all #[test]
+    #[test]: marks this fn as a test case. cargo test discovers all #[test]
     functions and runs each in its own thread.
 
     .unwrap() is "give me the value or panic". in real code we'd use ? or match,

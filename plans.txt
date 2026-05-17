@@ -12,7 +12,7 @@ PRINCIPLES
 - Each milestone is a commit-worthy state
 
 ----------------------------------------------------------------
-PHASE 1 — STORAGE ENGINE (Weeks 1-3)
+PHASE 1 — STORAGE ENGINE
 ----------------------------------------------------------------
 Goal: read and write documents to disk reliably.
 
@@ -55,7 +55,7 @@ Goal: read and write documents to disk reliably.
     restart the process, retrieve it again. Identical bytes.
 
 ----------------------------------------------------------------
-PHASE 2 — DOCUMENT LAYER (Week 3-4)
+PHASE 2 — DOCUMENT + COLLECTION LAYER
 ----------------------------------------------------------------
 Goal: structured documents on top of raw storage.
 
@@ -65,31 +65,41 @@ Goal: structured documents on top of raw storage.
                                 | Document(HashMap<String, Value>)
        - Serialization: BSON-inspired binary format
          (simpler than JSON, fixed-width numerics, length-prefixed strings)
-       - serialize(Document) -> Vec<u8>
-       - deserialize(bytes) -> Document
-       - Unit test: round-trip 10k random documents
+       - serialize_document(&Document) -> Vec<u8>
+       - deserialize_document(&[u8]) -> Result<Document, DecodeError>
+       - Unit tests: nested docs, bad tags, trailing bytes
+       - Ignored stress test: round-trip 10k generated documents
 
   2.2  Collection
-       - Named collection backed by a HeapFile
-       - Catalog entry: collection name → HeapFile root page
-       - insert(doc) -> DocId
-       - get(DocId) -> Document
+       - Thin wrapper around HeapFile that stores encoded Documents
+       - insert(&Document) -> DocId
+       - get(DocId) -> Result<Option<Document>>
        - delete(DocId)
-       - scan() -> iterator<(DocId, Document)>
+       - scan() -> Vec<(DocId, Document)> for v1
+       - Persist/reopen using a known heap root page
+       - Note: streaming scan moves to the query executor phase
 
   2.3  Catalog
        - Persisted metadata on page 0 of the database file
-       - Tracks: collection names, root pages, schema if declared
-       - create_collection(name, optional schema)
+       - Reserve page 0 before any HeapFile roots are allocated
+       - Tracks: collection name → heap root page
+       - create_collection(name)
        - drop_collection(name)
-       - get_collection(name) -> Collection
+       - open_collection(name) -> Collection
+       - Persist catalog across restart
+       - Schema metadata can be added later after the basic catalog is stable
 
   Phase 2 milestone:
+    Create a database with catalog page 0, create users collection,
+    insert many documents, flush/restart, reopen users by name,
+    scan all back, verify count unchanged.
+
+  Phase 2 stress target:
     Programmatically insert 1M documents into a collection,
     scan all back, verify count. Persist and restart, count unchanged.
 
 ----------------------------------------------------------------
-PHASE 3 — B-TREE INDEX (Weeks 4-6)
+PHASE 3 — B-TREE INDEX
 ----------------------------------------------------------------
 Goal: fast point lookups and range scans on indexed fields.
 
@@ -129,7 +139,7 @@ Goal: fast point lookups and range scans on indexed fields.
     Point lookup faster than sequential scan at >1k documents
 
 ----------------------------------------------------------------
-PHASE 4 — LEXER + PARSER (Weeks 6-7)
+PHASE 4 — LEXER + PARSER
 ----------------------------------------------------------------
 Goal: tokenize and parse ASL queries into an AST.
 
@@ -194,7 +204,7 @@ Goal: tokenize and parse ASL queries into an AST.
                  | limit 25
 
 ----------------------------------------------------------------
-PHASE 5 — QUERY ENGINE (Weeks 7-9)
+PHASE 5 — QUERY ENGINE
 ----------------------------------------------------------------
 Goal: execute parsed pipelines against real data.
 
@@ -249,7 +259,7 @@ Goal: execute parsed pipelines against real data.
     Restart process. Query again. Same result.
 
 ----------------------------------------------------------------
-PHASE 6 — INTERFACE + POLISH (Week 9-10)
+PHASE 6 — INTERFACE + POLISH
 ----------------------------------------------------------------
 Goal: something you can actually demo and put on GitHub.
 
