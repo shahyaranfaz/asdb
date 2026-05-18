@@ -1,5 +1,5 @@
 /*
-document.rs: structured values plus a tiny binary encoding.
+codec.rs: tiny binary encoding for document values.
 
 Storage only understands bytes. This module is the bridge between "user-shaped
 data" and "heap record bytes".
@@ -19,8 +19,9 @@ table, no object byte length, no cstrings. Just enough structure to round-trip
 documents without pulling in serde yet.
 */
 
-use std::collections::HashMap;
 use std::fmt;
+
+use crate::document::value::{Document, Value};
 
 const TAG_NULL: u8 = 0x00;
 const TAG_BOOL_FALSE: u8 = 0x01;
@@ -30,26 +31,6 @@ const TAG_FLOAT: u8 = 0x04;
 const TAG_STRING: u8 = 0x05;
 const TAG_ARRAY: u8 = 0x06;
 const TAG_DOCUMENT: u8 = 0x07;
-
-pub type Document = HashMap<String, Value>;
-
-/*
-Value: the document value tree.
-
-This is the Phase 2 "document model" from plans.txt. A top-level Document is
-just a HashMap<String, Value>, and nested documents reuse the same type through
-Value::Document. We keep numbers simple for v1: signed 64-bit ints and f64s.
-*/
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Int(i64),
-    Float(f64),
-    String(String),
-    Bool(bool),
-    Null,
-    Array(Vec<Value>),
-    Document(Document),
-}
 
 /*
 DecodeError: things that can go wrong while turning bytes back into Values.

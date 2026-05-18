@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::collection::Collection;
+use crate::document::collection::Collection;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk::DiskManager;
 use crate::storage::heap::HeapFile;
@@ -278,7 +278,7 @@ fn write_u16(buf: &mut [u8], offset: usize, val: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Document, Value};
+    use crate::document::value::{Document, Value};
     use tempfile::NamedTempFile;
 
     #[test]
