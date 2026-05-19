@@ -15,15 +15,16 @@ Important design choice:
   Database object with one shared BufferPool.
 */
 
-use std::collections::HashMap;
-use std::fmt;
-use std::path::{Path, PathBuf};
-
 use crate::document::collection::Collection;
+
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk::DiskManager;
 use crate::storage::heap::HeapFile;
 use crate::storage::page::{Page, PageId, PAGE_SIZE};
+
+use std::collections::HashMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 const CATALOG_PAGE_ID: PageId = 0;
 const CATALOG_MAGIC: &[u8; 8] = b"ASDBCAT1";

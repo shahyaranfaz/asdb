@@ -10,11 +10,13 @@ these are TRAITS. in rust, a method that lives on a trait (like file.read_exact)
 is only callable when that trait is in scope. so importing them is what turns on
 the dot-method syntax we use below.
 */
+
+// `crate::` means "from the root of this crate". this is how we reach into our own modules.
+use crate::storage::page::{Page, PageId, PAGE_SIZE};
+
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-// `crate::` means "from the root of this crate". this is how we reach into our own modules.
-use crate::storage::page::{Page, PageId, PAGE_SIZE};
 
 /*
 DiskManager: owns one file on disk and tracks how many pages live in it.

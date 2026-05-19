@@ -19,9 +19,9 @@ table, no object byte length, no cstrings. Just enough structure to round-trip
 documents without pulling in serde yet.
 */
 
-use std::fmt;
-
 use crate::document::value::{Document, Value};
+
+use std::fmt;
 
 const TAG_NULL: u8 = 0x00;
 const TAG_BOOL_FALSE: u8 = 0x01;

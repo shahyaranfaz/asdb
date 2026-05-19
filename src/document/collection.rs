@@ -14,12 +14,13 @@ the name -> heap root mapping on page 0. Collection only cares about turning
 Documents into heap records and back.
 */
 
-use std::fmt;
-
 use crate::document::codec::{deserialize_document, serialize_document, DecodeError};
 use crate::document::value::Document;
+
 use crate::storage::heap::{DocId, HeapFile};
 use crate::storage::page::PageId;
+
+use std::fmt;
 
 /*
 CollectionError: one error type for the collection boundary.
