@@ -79,7 +79,7 @@ impl BufferPool {
     range index, we just want to call Frame::empty() N times.
     */
     pub fn new(disk: DiskManager, capacity: usize) -> Self {
-        assert!(capacity > 0, "buffer pool capacity must be > 0");
+        assert!(capacity > 0, "buffer pool capacity must be positive");
         BufferPool {
             frames: (0..capacity).map(|_| Frame::empty()).collect(),
             page_table: HashMap::new(),

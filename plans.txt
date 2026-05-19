@@ -283,7 +283,17 @@ Goal: something you can actually demo and put on GitHub.
        - Every error includes: what went wrong, which stage, why
        - No panics in normal operation — all errors are Result<>
 
-  6.5  README
+  6.5  Database owner / shared buffer pool cleanup
+       - Introduce Database struct as the main runtime owner
+       - Database owns: Catalog, BufferPool, open collections, IndexManager
+       - Collection and IndexManager stop opening separate DiskManager /
+         BufferPool instances for the same file
+       - Remove manual flush-boundary footguns between collection writes
+         and index backfill / maintenance
+       - Keep low-level Storage, BTree, Collection, and IndexManager APIs
+         independently testable
+
+  6.6  README
        - What asdb is
        - ASL by example — 10 representative queries
        - Architecture overview (the 5 phases as a diagram)

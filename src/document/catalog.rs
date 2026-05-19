@@ -15,7 +15,7 @@ Important design choice:
   Database object with one shared BufferPool.
 */
 
-use crate::document::collection::Collection;
+use crate::document::collection::{Collection, CollectionError};
 
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::disk::DiskManager;
@@ -51,7 +51,10 @@ pub enum CatalogError {
     InvalidCatalog,
     CatalogFull,
     CollectionAlreadyExists(String),
+    IndexAlreadyExists(String),
+    IndexNotFound(String),
     CollectionNotFound(String),
+    Collection(CollectionError),
 }
 
 impl fmt::Display for CatalogError {
@@ -60,12 +63,11 @@ impl fmt::Display for CatalogError {
             CatalogError::Io(err) => write!(f, "catalog io error: {err}"),
             CatalogError::InvalidCatalog => write!(f, "invalid catalog page"),
             CatalogError::CatalogFull => write!(f, "catalog page is full"),
-            CatalogError::CollectionAlreadyExists(name) => {
-                write!(f, "collection already exists: {name}")
-            }
-            CatalogError::CollectionNotFound(name) => {
-                write!(f, "collection not found: {name}")
-            }
+            CatalogError::CollectionAlreadyExists(name) => write!(f, "collection already exists: {name}"),
+            CatalogError::IndexAlreadyExists(name) => write!(f, "index already exists: {name}"),
+            CatalogError::IndexNotFound(name) => write!(f, "index not found: {name}"),
+            CatalogError::CollectionNotFound(name) => write!(f, "collection not found: {name}"),
+            CatalogError::Collection(err) => write!(f, "collection error: {err}"),
         }
     }
 }
@@ -78,11 +80,18 @@ impl From<std::io::Error> for CatalogError {
     }
 }
 
+impl From<CollectionError> for CatalogError {
+    fn from(err: CollectionError) -> Self {
+        CatalogError::Collection(err)
+    }
+}
+
 pub type CatalogResult<T> = Result<T, CatalogError>;
 
 pub struct Catalog {
     path: PathBuf,
     collections: HashMap<String, PageId>,
+    pub(crate) indexes: HashMap<(String, String), PageId>,
     buffer_pool_capacity: usize,
 }
 
@@ -99,7 +108,7 @@ impl Catalog {
         if disk.num_pages() == 0 {
             let page_id = disk.allocate_page()?;
             assert_eq!(page_id, CATALOG_PAGE_ID);
-            let page = encode_catalog_page(&HashMap::new())?;
+            let page = encode_catalog_page(&HashMap::new(), &HashMap::new())?;
             disk.write_page(CATALOG_PAGE_ID, &page)?;
         }
         Self::open(path)
@@ -117,10 +126,11 @@ impl Catalog {
             return Err(CatalogError::InvalidCatalog);
         }
         let page = disk.read_page(CATALOG_PAGE_ID)?;
-        let collections = decode_catalog_page(&page)?;
+        let (collections, indexes) = decode_catalog_page(&page)?;
         Ok(Catalog {
             path: path.to_path_buf(),
             collections,
+            indexes,
             buffer_pool_capacity: DEFAULT_BUFFER_POOL_CAPACITY,
         })
     }
@@ -184,13 +194,14 @@ impl Catalog {
 
     pub fn flush(&self) -> CatalogResult<()> {
         let mut disk = DiskManager::open(&self.path)?;
-        let page = encode_catalog_page(&self.collections)?;
+        let page = encode_catalog_page(&self.collections, &self.indexes)?;
         disk.write_page(CATALOG_PAGE_ID, &page)?;
         Ok(())
     }
 }
 
-fn encode_catalog_page(collections: &HashMap<String, PageId>) -> CatalogResult<Page> {
+fn encode_catalog_page(collections: &HashMap<String, PageId>,
+                       indexes: &HashMap<(String, String), PageId>) -> CatalogResult<Page> {
     let mut page = Page::new();
     page.data[MAGIC_OFFSET..MAGIC_OFFSET + CATALOG_MAGIC.len()].copy_from_slice(CATALOG_MAGIC);
     write_u32(&mut page.data, COUNT_OFFSET, collections.len() as u32);
@@ -217,10 +228,41 @@ fn encode_catalog_page(collections: &HashMap<String, PageId>) -> CatalogResult<P
         pos += 8;
     }
 
+    write_u32(&mut page.data, pos, indexes.len() as u32);
+    pos += 4;
+    for ((collection, field), root) in indexes {
+        let collection_bytes = collection.as_bytes();
+        let field_bytes = field.as_bytes();
+        if collection_bytes.len() > u16::MAX as usize || field_bytes.len() > u16::MAX as usize {
+            return Err(CatalogError::CatalogFull);
+        }
+        let entry_len = 2 + collection_bytes.len() + 2 + field_bytes.len() + 8;
+        if pos + entry_len > PAGE_SIZE {
+            return Err(CatalogError::CatalogFull);
+        }
+
+        // write collection name len + bytes
+        write_u16(&mut page.data, pos, collection_bytes.len() as u16);
+        pos += 2;
+        page.data[pos..pos + collection_bytes.len()].copy_from_slice(collection_bytes);
+        pos += collection_bytes.len();
+
+        // write field name len + bytes
+        write_u16(&mut page.data, pos, field_bytes.len() as u16);
+        pos += 2;
+        page.data[pos..pos + field_bytes.len()].copy_from_slice(field_bytes);
+        pos += field_bytes.len();
+
+        // write root u64
+        write_u64(&mut page.data, pos, *root);
+        pos += 8;
+    }
+
     Ok(page)
 }
 
-fn decode_catalog_page(page: &Page) -> CatalogResult<HashMap<String, PageId>> {
+fn decode_catalog_page(page: &Page)
+    -> CatalogResult<(HashMap<String, PageId>, HashMap<(String, String), PageId>)> {
     if &page.data[MAGIC_OFFSET..MAGIC_OFFSET + CATALOG_MAGIC.len()] != CATALOG_MAGIC {
         return Err(CatalogError::InvalidCatalog);
     }
@@ -230,15 +272,11 @@ fn decode_catalog_page(page: &Page) -> CatalogResult<HashMap<String, PageId>> {
     let mut collections = HashMap::with_capacity(count);
 
     for _ in 0..count {
-        if pos + 2 > PAGE_SIZE {
-            return Err(CatalogError::InvalidCatalog);
-        }
+        if pos + 2 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
         let name_len = read_u16(&page.data, pos) as usize;
         pos += 2;
 
-        if pos + name_len + 8 > PAGE_SIZE {
-            return Err(CatalogError::InvalidCatalog);
-        }
+        if pos + name_len + 8 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
         let name = std::str::from_utf8(&page.data[pos..pos + name_len])
             .map_err(|_| CatalogError::InvalidCatalog)?
             .to_string();
@@ -249,7 +287,38 @@ fn decode_catalog_page(page: &Page) -> CatalogResult<HashMap<String, PageId>> {
         collections.insert(name, root);
     }
 
-    Ok(collections)
+    //read indexes
+    if pos + 4 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+    let count = read_u32(&page.data, pos) as usize;
+    let mut indexes = HashMap::with_capacity(count);
+    pos += 4;
+
+    for _ in 0..count {
+        // read collection name len + bytes
+        if pos + 2 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        let name_len = read_u16(&page.data, pos) as usize;
+        pos += 2;
+        if pos + name_len > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        let name: String = read_string(&page.data, pos, name_len)?;
+        pos += name_len;
+
+        // read field name len + bytes
+        if pos + 2 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        let field_len = read_u16(&page.data, pos) as usize;
+        pos += 2;
+        if pos + field_len > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        let field: String = read_string(&page.data, pos, field_len)?;
+        pos += field_len;
+
+        // read root u64
+        if pos + 8 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        let root: PageId = read_u64(&page.data, pos);
+        pos += 8;
+
+        //insert the entry
+        indexes.insert((name, field), root);
+    }
+    Ok((collections, indexes))
 }
 
 fn read_u64(buf: &[u8], offset: usize) -> u64 {
@@ -274,6 +343,12 @@ fn read_u16(buf: &[u8], offset: usize) -> u16 {
 
 fn write_u16(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+fn read_string(buf: &[u8], offset: usize, len: usize) -> CatalogResult<String> {
+    std::str::from_utf8(&buf[offset..offset + len])
+        .map(|s| s.to_string())
+        .map_err(|_| CatalogError::InvalidCatalog)
 }
 
 #[cfg(test)]
@@ -345,6 +420,34 @@ mod tests {
         assert!(matches!(
             catalog.open_collection("users"),
             Err(CatalogError::CollectionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_decode_catalog_rejects_bad_index_utf8() {
+        let mut page = encode_catalog_page(&HashMap::new(), &HashMap::new()).unwrap();
+        let pos = ENTRIES_OFFSET + 4;
+
+        write_u32(&mut page.data, ENTRIES_OFFSET, 1);
+        write_u16(&mut page.data, pos, 1);
+        page.data[pos + 2] = 0xff;
+        write_u16(&mut page.data, pos + 3, 1);
+        page.data[pos + 5] = b'x';
+        write_u64(&mut page.data, pos + 6, 12);
+
+        assert!(matches!(decode_catalog_page(&page), Err(CatalogError::InvalidCatalog)));
+    }
+
+    #[test]
+    fn test_encode_catalog_rejects_oversized_index_section() {
+        let mut indexes = HashMap::new();
+        for i in 0..400 {
+            indexes.insert((format!("collection-{i}"), format!("field-{i}")), i as PageId);
+        }
+
+        assert!(matches!(
+            encode_catalog_page(&HashMap::new(), &indexes),
+            Err(CatalogError::CatalogFull)
         ));
     }
 
