@@ -308,6 +308,31 @@ Scope rule:
   queries first. Joins, grouping, aggregate execution, and external sort are
   parsed already, but can move to Phase 6/7 if they threaten the v1 milestone.
 
+Usage story:
+  ASL is the database command/query language. In Phase 5 it should be usable
+  through Database::execute(&str) for:
+  - schema/data-definition commands:
+      create users { id: int required unique, name: string, age: int }
+      create index on users.id
+  - small/manual inserts:
+      from users | insert { id: 1, name: "alice", age: 25 }
+      from users | insert [
+        { id: 1, name: "alice", age: 25 },
+        { id: 2, name: "bob", age: 17 }
+      ]
+  - normal read queries:
+      from users | where age >= 18 | select name, age
+
+  Bulk data loading is not an ASL language feature for v1. Do not add syntax
+  like `load users from "users.csv"` in Phase 5. Bulk import belongs in the
+  CLI/interface phase as commands that call Database::insert_doc repeatedly.
+  CSV and JSONL are the likely first import formats. XLSX import is optional
+  later tooling, not core engine work.
+
+  Multi-statement `.asl` files are an interface concern. Phase 5 may expose
+  single-statement Database::execute(&str). Phase 6 can add `asdb run file.asl`
+  with semicolon-separated statements or one statement per REPL entry.
+
 Current query module state:
   src/query/binder.rs, planner.rs, and executor.rs exist as empty modules.
 
@@ -494,23 +519,46 @@ query surface beyond the v1 milestone.
 
   6.7  File execution
        - asdb run query.asl
-       - Read ASL from file, execute, print results
+       - Read ASL from file, execute statements, print results
+       - Support schema files such as schema.asl:
+           create users { id: int required unique, name: string, age: int };
+           create index on users.id;
+           create index on users.age;
+       - Use semicolon-separated statements for files, or document a strict
+         one-statement-per-file rule if semicolon parsing is not added yet
 
   6.8  CLI
        - asdb repl
        - asdb run <file>
+       - asdb import <collection> <file.csv>
+       - asdb import <collection> <file.jsonl>
        - asdb bench
        - asdb info
 
-  6.9  Error messages
+  6.9  Bulk import
+       - Import is a CLI/tooling feature, not ASL syntax
+       - CSV with headers:
+           asdb import users users.csv
+       - JSONL:
+           asdb import users users.jsonl
+       - Convert each row/object into a Document and call Database::insert_doc
+       - Use schema metadata when available for parsing field types
+       - Report row-level errors clearly
+       - XLSX can be considered later, but is not core v1
+
+  6.10 Error messages
        - Every public error says what went wrong and where
        - No panics in normal operation
        - Convert parser/binder/planner/executor/storage errors into friendly
          top-level diagnostics
 
-  6.10 README
+  6.11 README
        - What asdb is
        - ASL by example
+       - Recommended workflow:
+           asdb run schema.asl
+           asdb import users users.csv
+           asdb run query.asl
        - Architecture overview
        - Current phase status
        - Benchmark results from teach.cs
