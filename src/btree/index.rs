@@ -8,12 +8,6 @@ pub struct IndexManager<'a> {
     pool: &'a mut BufferPool,
 }
 
-pub struct IndexEntry {
-    pub collection: String,
-    pub field: String,
-    pub root: PageId,
-}
-
 impl<'a> IndexManager<'a> {
     pub fn new(catalog: &'a mut Catalog, pool: &'a mut BufferPool) -> Self {
         IndexManager { catalog, pool }
@@ -193,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_caller_coordinated_insert_search_and_range() {
+    fn test_index_manager_insert_hook_search_and_range() {
         let tmp = NamedTempFile::new().unwrap();
         let mut catalog = Catalog::create(tmp.path()).unwrap();
         let mut users = catalog.create_collection("users").unwrap();
@@ -232,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_caller_fetches_doc_before_delete_then_updates_index() {
+    fn test_index_manager_delete_hook_removes_entry() {
         let tmp = NamedTempFile::new().unwrap();
         let mut catalog = Catalog::create(tmp.path()).unwrap();
         let mut users = catalog.create_collection("users").unwrap();

@@ -299,7 +299,7 @@ Goal: tokenize and parse ASL into an AST. No execution happens here.
 
 ----------------------------------------------------------------
 PHASE 5 — QUERY ENGINE V1
-Status: NOT STARTED
+Status: IN PROGRESS
 ----------------------------------------------------------------
 Goal: execute the useful Phase 4 AST surface against real data.
 
@@ -312,7 +312,7 @@ Current query module state:
   src/query/binder.rs, planner.rs, and executor.rs exist as empty modules.
 
   5.1  Runtime owner
-       Required for clean execution
+       Status: complete
        - Introduce Database as the public execution owner
        - Database opens one database file
        - Database owns or coordinates:
@@ -324,6 +324,33 @@ Current query module state:
          insert/delete APIs
        - Avoid separate Collection and IndexManager views of the same file
          causing flush-boundary surprises
+
+       Implemented:
+       - Database::create(path)
+       - Database::open(path)
+       - has_collection(name)
+       - has_index(collection, field)
+       - create_collection(name)
+       - drop_collection(name), including dropping that collection's indexes
+       - create_index(collection, field)
+       - drop_index(collection, field)
+       - insert_doc(collection, doc), including index maintenance
+       - delete_doc(collection, doc_id), including pre-delete document fetch
+         and index maintenance
+       - get_doc(collection, doc_id)
+       - scan_collection(collection)
+       - search_index(collection, field, value)
+       - range_index(collection, field, low, high)
+
+       Tests cover:
+       - create/reopen collection
+       - insert and scan
+       - index backfill
+       - insert updates index
+       - delete updates index
+       - indexed range fetches documents
+       - reopen preserves data and index metadata
+       - drop collection removes indexes
 
   5.2  Binder / validation
        - Accept Statement from parser
@@ -392,12 +419,10 @@ Current query module state:
   5.6  Mutation execution
        - Insert:
            convert parsed DocLiteral to Document
-           collection.insert
-           index_manager.on_insert
+           call Database::insert_doc
        - Delete:
-           fetch document before deletion
-           collection.delete
-           index_manager.on_delete
+           identify matching DocIds
+           call Database::delete_doc
        - Update:
            either defer to a later phase, or implement as delete+insert/rewrite
            with correct index maintenance. Do not fake this if HeapFile has no

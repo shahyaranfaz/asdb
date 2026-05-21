@@ -142,6 +142,20 @@ impl Catalog {
         names
     }
 
+    pub fn has_index(&self, collection: &str, field: &str) -> bool {
+        self.indexes.contains_key(&(collection.to_string(), field.to_string()))
+    }
+
+    pub fn index_fields(&self, collection: &str) -> Vec<String> {
+        let mut fields: Vec<String> = self.indexes
+            .keys()
+            .filter(|(col, _)| col == collection)
+            .map(|(_, field)| field.clone())
+            .collect();
+        fields.sort();
+        fields
+    }
+
     /*
     create_collection: allocate a new HeapFile root and persist its name.
 

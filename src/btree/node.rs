@@ -135,11 +135,6 @@ impl<'a> InternalNode<'a> {
         u64::from_le_bytes(self.page.data[5..13].try_into().unwrap())
     }
 
-    pub fn set_leftmost_child(&mut self, child: PageId) {
-        let bytes: [u8; 8] = child.to_le_bytes();
-        self.page.data[5..13].copy_from_slice(&bytes);
-    }
-
     pub fn insert_slot(&mut self, key: &[u8], child: PageId) {
         let key_count: usize = self.get_key_count();
         let insert_index: usize = self.lower_bound_key(key);
@@ -247,13 +242,6 @@ pub trait BNodeSerializer {
     fn get_page(&self) -> &[u8];
     fn get_page_mut(&mut self) -> &mut [u8];
     fn get_slot_start(&self, i: usize) -> usize;
-
-    fn get_slot_key_offset(&self, i: usize) -> usize {
-        let slot_start = self.get_slot_start(i);
-        u16::from_le_bytes(
-            self.get_page()[slot_start..slot_start+2].try_into().unwrap()
-        ) as usize
-    }
 
     fn has_space(&self, key_len: usize) -> bool {
         let free_offset: usize = self.get_free_offset();

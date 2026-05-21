@@ -11,8 +11,9 @@
 //   ASDB_BENCH_PRESSURE_LOOKUPS=1000000
 
 use asdb::btree::BTree;
-use asdb::document::{serialize_key, Collection, Document, Value};
-use asdb::storage::{BufferPool, DiskManager, DocId, HeapFile};
+use asdb::database::Database;
+use asdb::document::{serialize_key, Document, Value};
+use asdb::storage::{BufferPool, DiskManager, DocId};
 
 use std::env;
 use std::path::PathBuf;
@@ -59,12 +60,6 @@ fn make_pool(capacity: usize) -> (BufferPool, TempDb) {
     let tmp = TempDb::new();
     let disk = DiskManager::open(&tmp.path).unwrap();
     (BufferPool::new(disk, capacity), tmp)
-}
-
-fn make_collection(capacity: usize) -> (Collection, TempDb) {
-    let (pool, tmp) = make_pool(capacity);
-    let heap = HeapFile::create(pool).unwrap();
-    (Collection::create(heap), tmp)
 }
 
 fn make_btree(pool: &mut BufferPool) -> BTree<'_> {
@@ -236,14 +231,14 @@ fn bench_crossover(samples: usize) {
     let sizes: &[usize] = &[100, 500, 1_000, 5_000, 10_000, 50_000, 100_000];
 
     for &n in sizes {
-        let (mut pool, _tmp) = make_pool(DEFAULT_POOL_CAPACITY);
-        let mut btree = make_btree(&mut pool);
-        let (mut collection, _collection_tmp) = make_collection(DEFAULT_POOL_CAPACITY);
+        let tmp = TempDb::new();
+        let mut db = Database::create(&tmp.path).unwrap();
+        db.create_collection("users").unwrap();
+        db.create_index("users", "age").unwrap();
 
         for i in 0..n as i64 {
             let doc = user_doc(i, i);
-            let doc_id = collection.insert(&doc).unwrap();
-            btree.insert(&int_key(i), doc_id).unwrap();
+            db.insert_doc("users", &doc).unwrap();
         }
 
         let mut rng: u64 = 0x9e3779b97f4a7c15 ^ n as u64;
@@ -252,16 +247,15 @@ fn bench_crossover(samples: usize) {
 
         for _ in 0..samples {
             let age = (next_random(&mut rng) % n as u64) as i64;
-            let target = int_key(age);
 
             let t = Instant::now();
-            let indexed = btree.search(&target).unwrap();
+            let indexed = db.search_index("users", "age", &Value::Int(age)).unwrap();
             index_total += t.elapsed();
             assert!(indexed.is_some());
 
             let t = Instant::now();
-            let found = collection
-                .scan()
+            let found = db
+                .scan_collection("users")
                 .unwrap()
                 .into_iter()
                 .find(|(_, doc)| doc.get("age") == Some(&Value::Int(age)));
