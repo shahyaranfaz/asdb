@@ -378,6 +378,7 @@ Current query module state:
        - drop collection removes indexes
 
   5.2  Binder / validation
+       Status: complete
        - Accept Statement from parser
        - Reject nonexistent collections
        - Reject nonexistent indexes for explicit `use index`
@@ -392,7 +393,21 @@ Current query module state:
        - Schema-aware field/type checking can be basic at first because
          catalog schema persistence is not complete yet
 
+       Implemented:
+       - bind(db, statement) -> BoundStatement
+       - validates collection existence for pipelines and DDL
+       - validates explicit index hints
+       - validates create/drop single-field indexes against current runtime
+         support
+       - rejects duplicate schema fields
+       - rejects duplicate insert document fields
+       - validates terminal Insert/Update/Delete stages
+       - rejects aggregate select expressions without a prior group stage
+       - keeps composite runtime indexes unsupported until the index layer
+         supports them
+
   5.3  Expression evaluator
+       Status: complete
        - eval(expr, document) -> Value
        - truthiness / boolean checks for where
        - Comparisons: == != > >= < <=
@@ -405,6 +420,16 @@ Current query module state:
        - Ternary if/then/else
        - Int/float coercion where sensible
        - Clear errors for invalid type combinations
+
+       Implemented:
+       - eval(expr, doc) -> Value
+       - eval_bool(expr, doc), strict bool result for where
+       - lit_to_value(lit)
+       - doc_literal_to_document(lit), restricted to literal/composite values
+         for now
+       - field lookup returns Null for missing fields
+       - aggregate evaluation is explicitly unsupported until group execution
+         exists
 
   5.4  Planner V1
        - Bound pipeline -> physical plan
