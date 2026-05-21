@@ -29,7 +29,7 @@ SYNTAX CONVENTIONS
 ----------------------------------------------------------------
 DATA MODEL
 ----------------------------------------------------------------
-shaydb stores collections of documents.
+asdb stores collections of documents.
 A document is a set of key-value pairs.
 Values can be:
     - Int        64-bit signed integer
