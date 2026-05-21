@@ -1,3 +1,6 @@
-pub mod node;
-pub mod btree;
-pub mod index;
+mod btree;
+mod index;
+mod node;
+
+pub use btree::BTree;
+pub use index::IndexManager;

@@ -57,8 +57,10 @@ design notes:
     string match.
 */
 
-use crate::asl::ast::*;
-use crate::asl::lexer::{Spanned, Token};
+use super::{
+    Assignment, BinOp, Direction, DocLiteral, Expr, LitValue, OrderKey, Pipeline, SchemaField,
+    SchemaType, SelectItem, Spanned, Stage, Statement, StringMatchOp, Token, UnaryOp,
+};
 
 use std::fmt;
 
@@ -958,7 +960,7 @@ fn require_field(expr: Expr, parser: &Parser<'_>) -> Result<String, ParseError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asl::lexer::tokenize;
+    use crate::asl::tokenize;
 
     fn parse_str(src: &str) -> Statement {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("lex failed on {src:?}: {e}"));

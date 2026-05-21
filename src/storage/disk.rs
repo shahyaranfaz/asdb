@@ -12,7 +12,7 @@ the dot-method syntax we use below.
 */
 
 // `crate::` means "from the root of this crate". this is how we reach into our own modules.
-use crate::storage::page::{Page, PageId, PAGE_SIZE};
+use super::{Page, PageId, PAGE_SIZE};
 
 use std::fs::{File, OpenOptions};
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};

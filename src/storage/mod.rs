@@ -1,4 +1,9 @@
-pub mod page;
-pub mod disk;
-pub mod buffer_pool;
-pub mod heap;
+mod buffer_pool;
+mod disk;
+mod heap;
+mod page;
+
+pub use buffer_pool::BufferPool;
+pub use disk::DiskManager;
+pub use heap::{DocId, HeapFile, MAX_RECORD_SIZE, SlotId};
+pub use page::{Page, PageId, PAGE_SIZE};

@@ -34,8 +34,7 @@ a doc id (DocId) is the pair (page_id, slot_id). that's what callers hold
 onto to reference a specific record.
 */
 
-use crate::storage::buffer_pool::BufferPool;
-use crate::storage::page::{Page, PageId, PAGE_SIZE};
+use super::{BufferPool, Page, PageId, PAGE_SIZE};
 
 pub type SlotId = u16;
 pub type DocId = (PageId, SlotId);
@@ -374,7 +373,8 @@ fn write_u16(buf: &mut [u8], offset: usize, val: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::disk::DiskManager;
+    use crate::storage::DiskManager;
+
     use tempfile::NamedTempFile;
 
     fn make_heap(capacity: usize) -> (HeapFile, NamedTempFile) {

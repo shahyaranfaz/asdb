@@ -10,16 +10,14 @@
 //   ASDB_BENCH_PRESSURE_N=1000000
 //   ASDB_BENCH_PRESSURE_LOOKUPS=1000000
 
+use asdb::btree::BTree;
+use asdb::document::{serialize_key, Collection, Document, Value};
+use asdb::storage::{BufferPool, DiskManager, DocId, HeapFile};
+
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
-use asdb::btree::btree::BTree;
-use asdb::document::{serialize_key, Collection, Document, Value};
-use asdb::storage::buffer_pool::BufferPool;
-use asdb::storage::disk::DiskManager;
-use asdb::storage::heap::{DocId, HeapFile};
 
 // ----------------------------------------------------------------
 // Config

@@ -14,11 +14,9 @@ the name -> heap root mapping on page 0. Collection only cares about turning
 Documents into heap records and back.
 */
 
-use crate::document::codec::{deserialize_document, serialize_document, DecodeError};
-use crate::document::value::Document;
+use super::{deserialize_document, serialize_document, DecodeError, Document};
 
-use crate::storage::heap::{DocId, HeapFile};
-use crate::storage::page::PageId;
+use crate::storage::{DocId, HeapFile, PageId};
 
 use std::fmt;
 
@@ -143,9 +141,9 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::value::Value;
-    use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::disk::DiskManager;
+    use crate::document::Value;
+    use crate::storage::{BufferPool, DiskManager};
+
     use tempfile::NamedTempFile;
 
     fn make_collection(capacity: usize) -> (Collection, NamedTempFile) {

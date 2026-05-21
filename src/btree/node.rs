@@ -1,5 +1,4 @@
-use crate::storage::heap::{DocId, SlotId};
-use crate::storage::page::{Page, PageId, PAGE_SIZE};
+use crate::storage::{DocId, Page, PageId, SlotId, PAGE_SIZE};
 
 // Leaf Nodes:
 // [0]: 0 | [1-2]: get_key_count | [3-4]: free_offset | [5-12]: next_leaf | [13..]: slot array

@@ -1,9 +1,7 @@
-use crate::btree::btree::BTree;
+use super::BTree;
 
-use crate::document::{Catalog, CatalogError, CatalogResult, Document, Value, serialize_key};
-use crate::storage::buffer_pool::BufferPool;
-use crate::storage::heap::DocId;
-use crate::storage::page::PageId;
+use crate::document::{serialize_key, Catalog, CatalogError, CatalogResult, Document, Value};
+use crate::storage::{BufferPool, DocId, PageId};
 
 pub struct IndexManager<'a> {
     catalog: &'a mut Catalog,
@@ -129,7 +127,7 @@ impl<'a> IndexManager<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::disk::DiskManager;
+    use crate::storage::DiskManager;
     use tempfile::NamedTempFile;
 
     fn make_doc(id: i64, age: i64, name: &str) -> Document {

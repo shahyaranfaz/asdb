@@ -15,8 +15,7 @@ high-level model:
   - LRU counter (`last_used`) drives which unpinned frame gets evicted next
 */
 
-use crate::storage::disk::DiskManager;
-use crate::storage::page::{Page, PageId};
+use super::{DiskManager, Page, PageId};
 
 use std::collections::HashMap;
 

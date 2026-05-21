@@ -11,16 +11,16 @@ The pub use lines below make the common names available as crate::document::X
 while still letting the files stay organized underneath.
 */
 
-pub mod catalog;
-pub mod codec;
-pub mod collection;
-pub mod key;
-pub mod value;
+mod catalog;
+mod codec;
+mod collection;
+mod key;
+mod value;
 
 pub use catalog::{Catalog, CatalogError, CatalogResult};
 pub use codec::{
     deserialize_document, deserialize_value, serialize_document, serialize_value, DecodeError,
 };
 pub use collection::{Collection, CollectionError, CollectionResult};
-pub use value::{Document, Value};
 pub use key::serialize_key;
+pub use value::{Document, Value};

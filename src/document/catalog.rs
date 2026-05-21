@@ -15,12 +15,9 @@ Important design choice:
   Database object with one shared BufferPool.
 */
 
-use crate::document::collection::{Collection, CollectionError};
+use super::{Collection, CollectionError};
 
-use crate::storage::buffer_pool::BufferPool;
-use crate::storage::disk::DiskManager;
-use crate::storage::heap::HeapFile;
-use crate::storage::page::{Page, PageId, PAGE_SIZE};
+use crate::storage::{BufferPool, DiskManager, HeapFile, Page, PageId, PAGE_SIZE};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -354,7 +351,8 @@ fn read_string(buf: &[u8], offset: usize, len: usize) -> CatalogResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::value::{Document, Value};
+    use crate::document::{Document, Value};
+
     use tempfile::NamedTempFile;
 
     #[test]

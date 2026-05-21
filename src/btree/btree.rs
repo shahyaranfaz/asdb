@@ -1,8 +1,6 @@
-use crate::btree::node::{BNode, BNodeSerializer, InternalNode, LeafNode, NO_NEXT_LEAF};
+use super::node::{BNode, BNodeSerializer, InternalNode, LeafNode, NO_NEXT_LEAF};
 
-use crate::storage::buffer_pool::BufferPool;
-use crate::storage::heap::DocId;
-use crate::storage::page::PageId;
+use crate::storage::{BufferPool, DocId, PageId};
 
 use std::io::Result;
 
@@ -533,7 +531,7 @@ impl<'a> BTree<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::disk::DiskManager;
+    use crate::storage::DiskManager;
     use tempfile::NamedTempFile;
 
     fn make_tree(capacity: usize) -> (BTree<'static>, NamedTempFile) {

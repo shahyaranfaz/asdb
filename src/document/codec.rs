@@ -19,7 +19,7 @@ table, no object byte length, no cstrings. Just enough structure to round-trip
 documents without pulling in serde yet.
 */
 
-use crate::document::value::{Document, Value};
+use super::{Document, Value};
 
 use std::fmt;
 

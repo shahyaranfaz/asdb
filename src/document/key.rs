@@ -1,4 +1,4 @@
-use crate::document::Value;
+use super::Value;
 
 pub fn serialize_key(value: &Value) -> Vec<u8> {
     match value {
