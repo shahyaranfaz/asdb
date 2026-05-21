@@ -1,5 +1,5 @@
 ================================================================
-asdb — Implementation Plan / Current Status
+asdb v1.0.0 — Implementation Plan / Current Status
 ================================================================
 
 Last verified: Phase 4 complete. `cargo test` passes with
@@ -560,5 +560,5 @@ Everything else — storage, BTree, parser, binder, planner, executor — should
 remain hand-rolled unless there is a deliberate reason to change that.
 
 ================================================================
-END OF PLAN
+END OF v1.0.0 PLAN
 ================================================================
