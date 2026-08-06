@@ -127,7 +127,11 @@ fn evaluate_unary_op(op: UnaryOp, expr: &Expr, doc: &Document) -> QueryResult<Va
     match op {
         UnaryOp::Not => Ok(Value::Bool(!evaluate_bool(expr, doc)?)),
         UnaryOp::Neg => match evaluate(expr, doc)? {
-            Value::Int(n) => Ok(Value::Int(-n)),
+            // checked for the same reason the binary ops are: -(i64::MIN) has
+            // no positive counterpart, and plain `-n` panics on it.
+            Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| {
+                QueryError::Arithmetic(format!("integer overflow negating {n}"))
+            }),
             Value::Float(n) => Ok(Value::Float(-n)),
             other => Err(QueryError::Type(format!(
                 "cannot negate {}",
@@ -158,14 +162,7 @@ fn evaluate_comparison(op: BinOp, left: &Value, right: &Value) -> QueryResult<Va
 
 fn evaluate_arithmetic(op: BinOp, left: &Value, right: &Value) -> QueryResult<Value> {
     match (left, right) {
-        (Value::Int(a), Value::Int(b)) => match op {
-            BinOp::Add => Ok(Value::Int(a + b)),
-            BinOp::Sub => Ok(Value::Int(a - b)),
-            BinOp::Mul => Ok(Value::Int(a * b)),
-            BinOp::Div => Ok(Value::Int(a / b)),
-            BinOp::Mod => Ok(Value::Int(a % b)),
-            _ => unreachable!(),
-        },
+        (Value::Int(a), Value::Int(b)) => evaluate_int_arithmetic(op, *a, *b),
         (Value::Int(a), Value::Float(b)) => evaluate_float_arithmetic(op, *a as f64, *b),
         (Value::Float(a), Value::Int(b)) => evaluate_float_arithmetic(op, *a, *b as f64),
         (Value::Float(a), Value::Float(b)) => evaluate_float_arithmetic(op, *a, *b),
@@ -186,6 +183,76 @@ fn evaluate_arithmetic(op: BinOp, left: &Value, right: &Value) -> QueryResult<Va
     }
 }
 
+/*
+evaluate_int_arithmetic: two ints, checked.
+
+Int op Int stays in i64 rather than promoting to f64. That is deliberate and
+unchanged: two ints should add to an int, and going through f64 silently loses
+precision past 2^53.
+
+WHY CHECKED AND NOT PLAIN OPERATORS.
+This used to be `a + b`, `a / b` and so on inline. Both of those panic:
+
+  from users where total / 0 > 1      panics, "attempt to divide by zero"
+  <sum past i64::MAX>                 panics in debug, WRAPS SILENTLY in
+                                      release
+
+Neither is acceptable from a user query. The first takes the database down;
+the second returns a wrong number with no signal, which is worse. Both are
+ordinary things for a query over real data to do, so both have to be errors
+the caller can report rather than process-level failures.
+
+checked_div and checked_rem return None for two distinct reasons, a zero
+divisor and i64::MIN / -1, so the zero case is tested first to give the
+accurate message rather than blaming overflow for a division by zero.
+*/
+fn evaluate_int_arithmetic(op: BinOp, left: i64, right: i64) -> QueryResult<Value> {
+    let overflow = || {
+        QueryError::Arithmetic(format!(
+            "integer overflow evaluating {left} {} {right}",
+            op_symbol(op)
+        ))
+    };
+
+    let result = match op {
+        BinOp::Add => left.checked_add(right).ok_or_else(overflow)?,
+        BinOp::Sub => left.checked_sub(right).ok_or_else(overflow)?,
+        BinOp::Mul => left.checked_mul(right).ok_or_else(overflow)?,
+        BinOp::Div | BinOp::Mod => {
+            if right == 0 {
+                return Err(QueryError::Arithmetic(format!(
+                    "division by zero evaluating {left} {} {right}",
+                    op_symbol(op)
+                )));
+            }
+            if op == BinOp::Div {
+                left.checked_div(right).ok_or_else(overflow)?
+            } else {
+                left.checked_rem(right).ok_or_else(overflow)?
+            }
+        }
+        _ => unreachable!("caller restricted op to arithmetic"),
+    };
+    Ok(Value::Int(result))
+}
+
+fn op_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        _ => "?",
+    }
+}
+
+/*
+Float arithmetic is deliberately NOT checked. IEEE 754 defines division by
+zero as inf / -inf / NaN, and those are legitimate f64 values rather than
+failures, so 1.0 / 0.0 stays inf. Only the integer path has cases with no
+representable answer at all.
+*/
 fn evaluate_float_arithmetic(op: BinOp, left: f64, right: f64) -> QueryResult<Value> {
     match op {
         BinOp::Add => Ok(Value::Float(left + right)),
@@ -197,7 +264,7 @@ fn evaluate_float_arithmetic(op: BinOp, left: f64, right: f64) -> QueryResult<Va
     }
 }
 
-fn values_equal(left: &Value, right: &Value) -> bool {
+pub(crate) fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
         (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
@@ -205,7 +272,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn compare_values(left: &Value, right: &Value) -> QueryResult<Ordering> {
+pub(crate) fn compare_values(left: &Value, right: &Value) -> QueryResult<Ordering> {
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
         (Value::Int(a), Value::Float(b)) => compare_floats(*a as f64, *b),
@@ -240,7 +307,7 @@ fn value_to_string(value: &Value) -> QueryResult<String> {
     }
 }
 
-fn value_name(value: &Value) -> &'static str {
+pub(crate) fn value_name(value: &Value) -> &'static str {
     match value {
         Value::Int(_) => "int",
         Value::Float(_) => "float",
@@ -383,5 +450,101 @@ mod tests {
             doc.get("tags"),
             Some(&Value::Array(vec![Value::String("admin".to_string())]))
         );
+    }
+
+    /*
+    The three cases below all PANICKED before checked arithmetic went in:
+    "attempt to divide by zero" and "attempt to add with overflow". A user
+    query must not be able to take the process down, and in release builds the
+    overflow case did not even panic, it wrapped and returned a wrong number.
+    */
+    #[test]
+    fn test_int_division_by_zero_is_an_error_not_a_panic() {
+        let expr = Expr::BinOp(BinOp::Div, Box::new(int(1)), Box::new(int(0)));
+        assert!(matches!(
+            evaluate(&expr, &doc()),
+            Err(QueryError::Arithmetic(_))
+        ));
+
+        let expr = Expr::BinOp(BinOp::Mod, Box::new(int(1)), Box::new(int(0)));
+        assert!(matches!(
+            evaluate(&expr, &doc()),
+            Err(QueryError::Arithmetic(_))
+        ));
+    }
+
+    #[test]
+    fn test_int_overflow_is_an_error_not_a_wrap() {
+        let expr = Expr::BinOp(BinOp::Add, Box::new(int(i64::MAX)), Box::new(int(1)));
+        assert!(matches!(
+            evaluate(&expr, &doc()),
+            Err(QueryError::Arithmetic(_))
+        ));
+
+        let expr = Expr::BinOp(BinOp::Mul, Box::new(int(i64::MAX)), Box::new(int(2)));
+        assert!(matches!(
+            evaluate(&expr, &doc()),
+            Err(QueryError::Arithmetic(_))
+        ));
+    }
+
+    #[test]
+    fn test_i64_min_divided_by_negative_one_overflows() {
+        // the case checked_div catches that a zero-divisor guard alone misses:
+        // -(i64::MIN) is not representable.
+        let expr = Expr::BinOp(BinOp::Div, Box::new(int(i64::MIN)), Box::new(int(-1)));
+        assert!(matches!(
+            evaluate(&expr, &doc()),
+            Err(QueryError::Arithmetic(_))
+        ));
+    }
+
+    #[test]
+    fn test_float_division_by_zero_stays_infinite() {
+        // NOT an error. IEEE 754 says inf, and inf is a legitimate f64.
+        let expr = Expr::BinOp(
+            BinOp::Div,
+            Box::new(Expr::Lit(LitValue::Float(1.0))),
+            Box::new(Expr::Lit(LitValue::Float(0.0))),
+        );
+        match evaluate(&expr, &doc()).unwrap() {
+            Value::Float(x) => assert!(x.is_infinite()),
+            other => panic!("expected an infinite float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_int_arithmetic_still_stays_int() {
+        // guards the existing decision: two ints make an int, no f64 promotion.
+        let expr = Expr::BinOp(BinOp::Add, Box::new(int(2)), Box::new(int(3)));
+        assert_eq!(evaluate(&expr, &doc()).unwrap(), Value::Int(5));
+
+        // and a value past 2^53, which an f64 round-trip would have corrupted.
+        let big = (1i64 << 53) + 1;
+        let expr = Expr::BinOp(BinOp::Add, Box::new(int(big)), Box::new(int(0)));
+        assert_eq!(evaluate(&expr, &doc()).unwrap(), Value::Int(big));
+    }
+
+    #[test]
+    fn test_string_concatenation_is_unaffected() {
+        // the checked-arithmetic change must not disturb the string + path.
+        let expr = Expr::BinOp(
+            BinOp::Add,
+            Box::new(Expr::Lit(LitValue::String("a".to_string()))),
+            Box::new(int(5)),
+        );
+        assert_eq!(
+            evaluate(&expr, &doc()).unwrap(),
+            Value::String("a5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_negating_i64_min_is_an_error_not_a_panic() {
+        let expr = Expr::UnaryOp(UnaryOp::Neg, Box::new(int(i64::MIN)));
+        assert!(matches!(
+            evaluate(&expr, &doc()),
+            Err(QueryError::Arithmetic(_))
+        ));
     }
 }
