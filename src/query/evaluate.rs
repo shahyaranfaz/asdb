@@ -141,7 +141,39 @@ fn evaluate_unary_op(op: UnaryOp, expr: &Expr, doc: &Document) -> QueryResult<Va
     }
 }
 
+/*
+evaluate_comparison: the six comparison operators.
+
+A MISSING FIELD DOES NOT MATCH; IT DOES NOT ERROR.
+
+An ordering comparison where either side is Null returns false. This matters
+because Field on an absent key evaluates to Null, so without it a single
+document lacking a field fails the WHOLE query:
+
+    from users | where age > 18
+
+would error rather than skip, the moment one user document had no age. asl.txt
+permits schemaless documents, so that is a normal shape for real data, and it
+is also what Mongo does: { age: { $gt: 18 } } simply does not match a document
+without an age.
+
+Note what is NOT relaxed. A genuine cross-type comparison, `where name > 5` on
+a string field, still errors through compare_values below. That is a mistake in
+the query rather than a fact about the data, and it should stay loud.
+
+compare_values itself is left strict on purpose: Sort uses it, and a sort over
+a column mixing incomparable types should still fail rather than invent an
+order.
+*/
 fn evaluate_comparison(op: BinOp, left: &Value, right: &Value) -> QueryResult<Value> {
+    let ordering_op = matches!(
+        op,
+        BinOp::Gt | BinOp::GtEq | BinOp::Lt | BinOp::LtEq
+    );
+    if ordering_op && (matches!(left, Value::Null) || matches!(right, Value::Null)) {
+        return Ok(Value::Bool(false));
+    }
+
     let value = match op {
         BinOp::Eq => values_equal(left, right),
         BinOp::NotEq => !values_equal(left, right),
@@ -546,5 +578,37 @@ mod tests {
             evaluate(&expr, &doc()),
             Err(QueryError::Arithmetic(_))
         ));
+    }
+
+    #[test]
+    fn test_missing_field_does_not_match_and_does_not_error() {
+        /*
+        The schemaless case. Before this, one document without the field made
+        the whole query fail, which is not what a document store should do and
+        not what Mongo does.
+        */
+        let expr = Expr::BinOp(BinOp::Gt, Box::new(field("missing")), Box::new(int(18)));
+        assert_eq!(evaluate(&expr, &doc()).unwrap(), Value::Bool(false));
+
+        let expr = Expr::BinOp(BinOp::Lt, Box::new(field("missing")), Box::new(int(18)));
+        assert_eq!(evaluate(&expr, &doc()).unwrap(), Value::Bool(false));
+
+        // and with the literal on the left, so the relaxation is symmetric
+        let expr = Expr::BinOp(BinOp::GtEq, Box::new(int(18)), Box::new(field("missing")));
+        assert_eq!(evaluate(&expr, &doc()).unwrap(), Value::Bool(false));
+    }
+
+    #[test]
+    fn test_genuine_type_mismatches_still_error() {
+        // the relaxation above must not swallow a real query mistake: `name`
+        // is a string, so ordering it against an int is nonsense.
+        let expr = Expr::BinOp(BinOp::Gt, Box::new(field("name")), Box::new(int(5)));
+        assert!(matches!(evaluate(&expr, &doc()), Err(QueryError::Type(_))));
+    }
+
+    #[test]
+    fn test_equality_against_a_missing_field_is_still_false() {
+        let expr = Expr::BinOp(BinOp::Eq, Box::new(field("missing")), Box::new(int(18)));
+        assert_eq!(evaluate(&expr, &doc()).unwrap(), Value::Bool(false));
     }
 }
