@@ -2,8 +2,8 @@
 asdb v1.0.0 — Implementation Plan / Current Status
 ================================================================
 
-Last verified: Phase 4 complete. `cargo test` passes with
-110 passed, 3 ignored.
+Last verified: 2026-08-06. Phases 1-5 and the implemented portions of
+Phase 6 pass `cargo test` with 207 passed, 4 ignored, 0 failed.
 
 This file is both a plan and a reflection of current functionality. Completed
 phases describe what the code does now. Future phases describe the remaining
@@ -299,18 +299,18 @@ Goal: tokenize and parse ASL into an AST. No execution happens here.
 
 ----------------------------------------------------------------
 PHASE 5 — QUERY ENGINE V1
-Status: IN PROGRESS
+Status: COMPLETE
 ----------------------------------------------------------------
 Goal: execute the useful Phase 4 AST surface against real data.
 
-Scope rule:
-  Phase 5 should deliver the end-to-end demo and common single-collection
-  queries first. Joins, grouping, aggregate execution, and external sort are
-  parsed already, but can move to Phase 6/7 if they threaten the v1 milestone.
+Scope delivered:
+  End-to-end DDL, reads, mutations, index-aware planning, and persistence are
+  implemented. Sort, grouping, aggregates, and inner hash joins were also
+  completed as part of the current engine.
 
 Usage story:
   ASL is the database command/query language. In Phase 5 it should be usable
-  through Database::execute(&str) for:
+  through the tokenize -> parse -> bind -> plan -> execute pipeline for:
   - schema/data-definition commands:
       create users { id: int required unique, name: string, age: int }
       create index on users.id
@@ -329,12 +329,13 @@ Usage story:
   CSV and JSONL are the likely first import formats. XLSX import is optional
   later tooling, not core engine work.
 
-  Multi-statement `.asl` files are an interface concern. Phase 5 may expose
-  single-statement Database::execute(&str). Phase 6 can add `asdb run file.asl`
-  with semicolon-separated statements or one statement per REPL entry.
+  Multi-statement `.asl` files remain an interface concern. The HTTP server
+  accepts one ASL statement per POST /query request. There is no
+  Database::execute(&str) convenience method yet.
 
 Current query module state:
-  src/query/binder.rs, planner.rs, and executor.rs exist as empty modules.
+  src/query/binder.rs, planner.rs, plan.rs, evaluate.rs, and executor.rs are
+  implemented and exercised by unit and end-to-end tests.
 
   5.1  Runtime owner
        Status: complete
@@ -428,10 +429,11 @@ Current query module state:
        - doc_literal_to_document(lit), restricted to literal/composite values
          for now
        - field lookup returns Null for missing fields
-       - aggregate evaluation is explicitly unsupported until group execution
-         exists
+       - standalone expression evaluation rejects aggregate calls; the group
+         executor evaluates them over grouped rows
 
   5.4  Planner V1
+       Status: complete
        - Bound pipeline -> physical plan
        - Physical operators for v1:
            SeqScan
@@ -446,17 +448,16 @@ Current query module state:
            DropCollection
            DropIndex
        - Simple index rule:
-           use IndexScan for single-field indexed predicates:
-             field == literal
-             field > literal
-             field >= literal
-             field < literal
-             field <= literal
-             bounded `and` range on the same field
+           use IndexScan for a single-field indexed equality or a bounded
+           `and` range on the same field
+           one-sided ranges currently fall back to SeqScan until the BTree
+           supports open-ended bounds
            otherwise use SeqScan + Filter
        - No cost model in v1
+       - Also plans order, group, aggregate, inner hash join, and update
 
   5.5  Executor V1
+       Status: complete
        - Execute physical plan against Database
        - For read pipelines, return Vec<Document> initially
        - Keep operator boundaries clean enough to move toward streaming later
@@ -465,25 +466,26 @@ Current query module state:
        - Filter applies expression evaluator
        - Projection builds output documents
        - Limit/Offset apply result slicing
+       - Pull-based operators materialize Vec<Document> at the result boundary
 
   5.6  Mutation execution
+       Status: complete
        - Insert:
            convert parsed DocLiteral to Document
            call Database::insert_doc
        - Delete:
            identify matching DocIds
            call Database::delete_doc
-       - Update:
-           either defer to a later phase, or implement as delete+insert/rewrite
-           with correct index maintenance. Do not fake this if HeapFile has no
-           update-in-place API.
+       - Update uses delete+insert semantics with index maintenance
+       - Mutations return QueryOutput::Affected
 
   5.7  Persistence
+       Status: complete
        - DDL and mutations flush as needed for restart tests
        - Restart process, reopen Database, rerun query, same result
 
   Phase 5 milestone:
-    End to end:
+    Complete and covered by end-to-end restart tests:
 
       create users { id: int required unique, name: string, age: int }
       create index on users.id
@@ -494,7 +496,7 @@ Current query module state:
 
     Restart. Query again. Same result.
 
-  Phase 5 test target:
+  Phase 5 verified coverage:
     - DDL creates persistent collections and indexes
     - Insert updates indexes
     - Where/select/limit/offset over SeqScan
@@ -504,45 +506,49 @@ Current query module state:
 
 ----------------------------------------------------------------
 PHASE 6 — QUERY FEATURES + INTERFACE
-Status: FUTURE
+Status: PARTIAL
 ----------------------------------------------------------------
 Goal: turn the Phase 5 engine into something pleasant to use and broaden the
 query surface beyond the v1 milestone.
 
   6.1  Streaming executor cleanup
-       - Replace read pipeline materialization with iterator-like operators
-       - Preserve Vec<Document> convenience at the public API boundary
-       - Avoid materializing full scans except for operators that need it
+       Status: complete for the current in-process engine
+       - Operators expose a pull-based next() interface
+       - Vec<Document> is preserved at the result boundary
+       - Sort, group, and join materialize state where required
 
   6.2  Sort / order by
+       Status: complete (in-memory)
        - In-memory sort for modest result sets
        - External sort can remain future work unless needed by benchmarks
        - Respect asc/desc over comparable Value types
 
   6.3  Update execution
-       - Add HeapFile/Collection rewrite support, or implement safe
-         delete+insert semantics
+       Status: complete
+       - Uses safe delete+insert semantics
        - Maintain indexes for changed indexed fields
        - Return updated row count
 
   6.4  Group and aggregate execution
+       Status: complete
        - HashAggregate for parsed `group`
-       - count, sum initially
-       - Later: avg, min, max
+       - count, sum, avg, min, max, collect
 
   6.5  Join execution
-       - Start with hash join for equality joins
-       - Use parsed Join stage:
+       Status: complete (inner equality hash join)
+       - Hash join for equality joins using the parsed Join stage:
            join <collection> on left_field == right_field
-       - Add tests with small collections first
+       - Covered by filtered and unfiltered multi-collection tests
 
   6.6  REPL
+       Status: future
        - Read a line, execute ASL, print result
        - Multi-line input when a trailing | suggests continuation
        - .help, .collections, .schema <name>, .quit
        - Pretty-print document results as a table
 
   6.7  File execution
+       Status: future
        - asdb run query.asl
        - Read ASL from file, execute statements, print results
        - Support schema files such as schema.asl:
@@ -553,6 +559,10 @@ query surface beyond the v1 milestone.
          one-statement-per-file rule if semicolon parsing is not added yet
 
   6.8  CLI
+       Status: partial
+       - Current binary starts the HTTP service and accepts a database path,
+         bind address, port, and repeatable TTL policy options
+       - The following planned subcommands remain future:
        - asdb repl
        - asdb run <file>
        - asdb import <collection> <file.csv>
@@ -561,6 +571,7 @@ query surface beyond the v1 milestone.
        - asdb info
 
   6.9  Bulk import
+       Status: future
        - Import is a CLI/tooling feature, not ASL syntax
        - CSV with headers:
            asdb import users users.csv
@@ -572,12 +583,14 @@ query surface beyond the v1 milestone.
        - XLSX can be considered later, but is not core v1
 
   6.10 Error messages
+       Status: partial
        - Every public error says what went wrong and where
        - No panics in normal operation
        - Convert parser/binder/planner/executor/storage errors into friendly
          top-level diagnostics
 
   6.11 README
+       Status: future
        - What asdb is
        - ASL by example
        - Recommended workflow:
@@ -588,75 +601,389 @@ query surface beyond the v1 milestone.
        - Current phase status
        - Benchmark results from teach.cs
 
-----------------------------------------------------------------
-PHASE 7 — BENCHMARKS + ENGINE POLISH
-Status: FUTURE
-----------------------------------------------------------------
-Goal: measure and improve the full database, not just the BTree.
+  6.12 HTTP/JSON service
+       Status: complete
+       - GET /health
+       - POST /query with one ASL statement in the request body
+       - JSON document, mutation, and stage-labelled error responses
+       - One thread per connection; Database access is serialized by a mutex
+       - Content-Length bodies up to 1 MiB
+       - No TLS, authentication, keep-alive, or chunked request bodies
 
-  B1  Insert throughput
-      - Sequential insert: 1M, 5M, 10M documents
-      - Random indexed field values: same sizes
-      - Measure docs/sec and wall time with and without indexes
-
-  B2  Point lookup latency
-      - Indexed vs non-indexed lookup
-      - 1M random lookups on large collection
-      - Measure p50, p95, p99 latency
-
-  B3  Range scan selectivity
-      - 0.1%, 1%, 10%, 50% of collection
-      - Indexed range vs sequential scan
-      - Find real crossover point for decoded documents
-
-  B4  Buffer pool pressure
-      - 10%, 25%, 50%, 100% of working set
-      - Measure throughput degradation
-      - Record eviction and dirty flush stats if instrumentation exists
-
-  B5  Write amplification
-      - Measure physical bytes written vs logical bytes inserted
-      - Compare unindexed and indexed collections
-
-  B6  Optimizer polish
-      - Add basic index selectivity estimates if needed
-      - Keep simple rule-based planner until measurements justify more
+  6.13 TTL sweeper
+       Status: complete
+       - Repeatable --ttl COLLECTION.FIELD=DURATION policies
+       - Background interval sweeps and a testable one-shot sweep
+       - Timestamp fields are epoch milliseconds stored as Int
+       - Documents missing the timestamp field are never expired
 
 ----------------------------------------------------------------
-OUT OF SCOPE — v1
+PHASE 7 — v1 RELEASE READINESS
+Status: REQUIRED BEFORE v1.0
 ----------------------------------------------------------------
-- WAL / crash recovery / transactions
-- Concurrent access / locking
-- Outer joins
-- Subqueries / nested pipelines
-- Full cost-based optimizer
-- Replication / distribution
-- Auth / permissions
-- Network protocol / server mode
+Goal: publish a narrow, honest, durable v1 rather than expand the language.
 
-These are v2 starting points, not failures of v1.
+v1 product contract:
+  A single-process document database with durable files, a schemaless mode,
+  ASL queries, secondary indexes, TTL expiration, an embedded Rust API, and a
+  local/private-network HTTP interface. It is not yet a transactional,
+  multi-writer, or internet-facing database.
+
+  7.1  One storage owner per database
+       Status: release blocker
+       - Fix the ignored multi-collection corruption test in
+         tests/multi_collection.rs
+       - Database owns one DiskManager and BufferPool for the whole file
+       - Collection, Catalog, HeapFile, and IndexManager borrow or share that
+         coordinated storage owner instead of opening independent pools
+       - Prevent overlapping allocators from assigning the same page
+       - Remove the test ignore and verify data after restart
+
+  7.2  Schema contract
+       Status: release blocker
+       - Persist declared schema metadata in the catalog
+       - Enforce int, float, string, bool, and any on insert/update
+       - Enforce required fields
+       - Implement unique with a maintained unique index or reject it clearly
+       - If persistence cannot ship in v1, reject non-empty schemas instead of
+         accepting and silently discarding them
+       - Add reopen, malformed-schema, and constraint violation tests
+
+  7.3  Data/index consistency
+       Status: release blocker
+       - Document the non-transactional write boundary explicitly
+       - Add an index consistency checker that compares index entries with
+         live heap documents
+       - Add online/offline index rebuild commands
+       - Make failed index creation clean up allocated pages and metadata
+       - Add failure-injection tests between heap, index, catalog, and flush
+         steps for insert, update, delete, create index, and drop index
+       - Never silently return incomplete indexed results after detected
+         inconsistency; fail loudly with repair guidance
+
+  7.4  Panic and corruption hardening
+       Status: release blocker
+       - Audit panic!, assert!, unwrap(), and expect() in non-test code
+       - Convert user input, unsupported index keys, malformed pages, pinned
+         frame exhaustion, and invalid on-disk state into typed errors
+       - Preserve assertions only for invariants proven by private callers
+       - Fuzz lexer, parser, document decoder, catalog decoder, BTree node
+         decoder, and HTTP request parsing
+       - Ensure one malformed query or file cannot terminate the server
+
+  7.5  Stable execution API
+       Status: required
+       - Add Database::execute(&str) -> Result<QueryOutput>
+       - Centralize tokenize, parse, bind, DDL, plan, and execute behavior
+       - Make HTTP, future REPL, tests, and embedded callers use the same path
+       - Define which Rust modules/types are stable public API
+
+  7.6  File-format contract
+       Status: release blocker
+       - Add file magic, format version, and compatibility checks
+       - Reject unsupported newer formats without modifying the file
+       - Define v1.x compatibility and migration policy
+       - Provide validate, backup, restore, and export paths before migrations
+       - Test truncated, corrupted, older, and unknown-version files
+
+  7.7  Resource limits
+       Status: required
+       - Configurable buffer-pool capacity
+       - Maximum HTTP body, result rows/bytes, join build size, group count,
+         collect size, and in-memory sort size
+       - Query timeout or cooperative cancellation
+       - Clear limit errors instead of process-wide OOM or unbounded work
+       - TTL sweeps operate in bounded batches
+
+  7.8  Lifecycle and operations
+       Status: required
+       - Graceful shutdown stops accepting requests, joins the TTL worker,
+         completes active work, and flushes dirty pages
+       - Refuse unsafe public bind addresses unless explicitly requested, or
+         print a prominent warning about missing authentication and TLS
+       - Add asdb info, validate, backup, restore, rebuild-index, and compact
+         command foundations
+       - Use stable exit codes and machine-readable diagnostics
+
+  7.9  Verification and packaging
+       Status: required
+       - CI on Linux and Windows: format, lint, build, unit, integration, and
+         doc tests
+       - All normal tests pass; no ignored known-correctness failures
+       - Run large stress tests and fuzz smoke tests in scheduled CI
+       - Benchmark a release build on a documented machine and dataset
+       - README, architecture guide, ASL reference, HTTP examples, backup and
+         recovery guide, limitations, license, changelog, and release notes
+       - Reproducible release binaries and checksums
+
+  v1.0 release gates:
+    [ ] Multi-collection persistence test passes without #[ignore]
+    [ ] Schema declarations are enforced or explicitly rejected
+    [ ] Index validation and rebuild succeed after injected partial failures
+    [ ] No user-controlled input reaches an unhandled panic
+    [ ] File magic/version and compatibility tests pass
+    [ ] Graceful shutdown and bounded-resource tests pass
+    [ ] Linux and Windows CI are green
+    [ ] Release benchmarks and operational documentation are published
 
 ----------------------------------------------------------------
-STRETCH GOALS
+PHASE 8 — DURABILITY, RECOVERY, AND TRANSACTIONS
+Status: POST-v1 PRIORITY
 ----------------------------------------------------------------
-- WAL: append-only log, replay on crash recovery
-- Server mode: TCP socket, send ASL queries over the wire
-- NUMA-aware buffer pool
-- External sort for very large ordered results
-- More aggregate functions
-- Schema persistence beyond the current AST/catalog roots
+Goal: make acknowledged writes recoverable and atomic across engine layers.
+
+  8.1  Write-ahead log
+       - WAL records with checksums, sequence numbers, and format version
+       - Write and fsync log records before dirty data pages
+       - Startup analysis and redo of committed operations
+       - Idempotent replay and torn-tail detection
+       - Checkpoints and safe WAL truncation
+
+  8.2  Atomic statements
+       - Begin/commit/abort around each mutation statement
+       - Undo or compensation for incomplete heap, BTree, and catalog changes
+       - Atomic multi-document insert/update/delete within one statement
+       - Crash tests at every persistence boundary
+
+  8.3  Explicit transactions
+       - ASL/API begin, commit, and rollback
+       - Read-your-writes and repeatable error semantics
+       - Savepoints as a later extension
+       - Define durability modes: synchronous, balanced, and unsafe-fast
+
+  8.4  Backup and recovery
+       - Consistent online snapshots coordinated with WAL/checkpoints
+       - Point-in-time recovery from snapshot plus archived WAL
+       - Backup verification and restore drills in CI
+
+----------------------------------------------------------------
+PHASE 9 — STORAGE LIFECYCLE AND ADVANCED INDEXES
+Status: POST-v1
+----------------------------------------------------------------
+Goal: control file growth and broaden efficient access paths.
+
+  9.1  Vacuum and compaction
+       - Reclaim tombstoned heap slots and empty pages
+       - Compact page chains and return free pages to the allocator
+       - Online incremental vacuum with bounded work
+       - Report reclaimable and reclaimed bytes
+
+  9.2  Index improvements
+       - Open-ended range scans for one-sided predicates
+       - Composite indexes with lexicographic key encoding
+       - Unique, sparse, and partial indexes
+       - Covering/index-only scans
+       - Background index build and rebuild
+       - Prefix scans where string encoding permits them
+
+  9.3  Large values and richer data
+       - Overflow pages for documents and index keys larger than one page
+       - Optional binary and timestamp value types
+       - Defined numeric coercion, NaN, infinity, and collation behavior
+       - Per-document size limits with actionable errors
+
+  9.4  Format evolution
+       - Forward migrations with preflight validation and rollback plan
+       - Feature flags in the file header
+       - Offline and eventually online migration tooling
+
+----------------------------------------------------------------
+PHASE 10 — COST-BASED QUERY ENGINE
+Status: POST-v1
+----------------------------------------------------------------
+Goal: turn the clean physical-operator model into a measured optimizer.
+
+  10.1 Statistics
+       - Row counts, null fractions, distinct estimates, min/max, and sampled
+         histograms per collection/index
+       - Analyze command and incremental statistics maintenance
+       - Persist statistics with freshness metadata
+
+  10.2 Cost model
+       - Estimate sequential scan, index scan, filter, sort, group, and join
+         cardinalities and costs
+       - Choose indexes by selectivity rather than first-match rules
+       - Combine useful predicates and choose join order/strategy
+       - EXPLAIN and EXPLAIN ANALYZE with estimates versus actuals
+
+  10.3 Execution at scale
+       - External merge sort with spill files
+       - Spillable hash aggregation and hash join
+       - Top-N sort for order + limit
+       - Projection/filter pushdown and limit pushdown
+       - Vectorized/batched operators where benchmarks justify them
+       - Query memory accounting and cancellation cleanup
+
+  10.4 Language depth
+       - Left/right/full outer joins
+       - Subqueries and nested pipelines
+       - Window functions
+       - Additional statistical aggregates and approximate distinct counts
+       - Explainable, backwards-compatible ASL grammar evolution
+
+----------------------------------------------------------------
+PHASE 11 — CONCURRENCY AND SERVER HARDENING
+Status: POST-v1
+----------------------------------------------------------------
+Goal: move from serialized local service to safe multi-client operation.
+
+  11.1 Concurrency control
+       - Multiple concurrent readers
+       - Page/record or MVCC-based write coordination selected by prototype
+         and benchmark evidence
+       - Deadlock prevention/detection or timestamp ordering
+       - Isolation levels with conformance tests
+
+  11.2 Production server
+       - Bounded worker pool or async I/O instead of a thread per connection
+       - Keep-alive, chunked bodies, backpressure, timeouts, and cancellation
+       - TLS and optional mutual TLS
+       - Authentication, database roles, and collection-level authorization
+       - Rate limits, request IDs, structured audit logging, and safe defaults
+
+  11.3 Observability
+       - Structured logs with stable event fields
+       - Metrics for latency, throughput, cache hit rate, evictions, flushes,
+         WAL/checkpoint lag, query memory, TTL work, and error classes
+       - Readiness separate from liveness
+       - Slow-query log and operator-level execution profiles
+
+----------------------------------------------------------------
+PHASE 12 — DEVELOPER EXPERIENCE AND ECOSYSTEM
+Status: POST-v1
+----------------------------------------------------------------
+Goal: make asdb pleasant to adopt, inspect, automate, and extend.
+
+  12.1 First-party tools
+       - REPL with multi-line editing, history, completion, and explain views
+       - Multi-statement file execution with clear transaction behavior
+       - Streaming CSV and JSONL import/export with row-level diagnostics
+       - Shell-friendly JSON output and human-friendly tables
+
+  12.2 Client ecosystem
+       - Versioned HTTP API and capability negotiation
+       - Rust client plus generated or hand-written Java, Python, and
+         TypeScript clients
+       - Connection pooling, retries limited to safe/idempotent operations,
+         and typed errors
+
+  12.3 Extensions
+       - Stable function/aggregate extension interface
+       - Optional user-defined functions in a sandboxed runtime such as WASM
+       - Pluggable tokenizers for eventual full-text search
+       - Extension versioning and resource limits
+
+----------------------------------------------------------------
+PHASE 13 — SEARCH, ANALYTICS, AND DISTRIBUTION
+Status: LONG-TERM
+----------------------------------------------------------------
+Goal: pursue differentiating capabilities only after the single-node core is
+durable, observable, and benchmarked.
+
+  13.1 Search
+       - Inverted full-text indexes, tokenization, ranking, and highlighting
+       - Geospatial point indexes and radius/bounding-box queries
+       - Optional vector type, approximate nearest-neighbor index, metadata
+         filtering, and hybrid lexical/vector ranking
+
+  13.2 Analytics
+       - Columnar temporary batches for analytical operators
+       - Parallel scans, joins, and aggregation on large local datasets
+       - Materialized views with refresh policies
+       - Parquet import/export and predicate pushdown
+
+  13.3 Replication
+       - Physical or logical replication selected after WAL semantics stabilize
+       - Leader/follower failover with fencing and split-brain prevention
+       - Read replicas and lag visibility
+       - Online backup from replicas
+
+  13.4 Distribution
+       - Explicit partitioning/sharding keys
+       - Routing, rebalancing, and distributed query planning
+       - Consensus-backed metadata and membership
+       - Distributed transactions only if demonstrated use cases justify them
+
+----------------------------------------------------------------
+BENCHMARK PROGRAM
+----------------------------------------------------------------
+Benchmarks are release evidence, not one-off marketing numbers. Preserve raw
+results, configuration, commit, compiler, OS, hardware, and dataset generator.
+
+  B1  Insert/update/delete throughput
+      - 1M, 5M, and 10M documents
+      - Sequential and random indexed values
+      - With zero, one, and several indexes
+      - Report logical throughput, physical bytes, and fsync policy
+
+  B2  Point and range reads
+      - Indexed versus sequential lookup
+      - p50, p95, p99, and maximum latency
+      - Cold cache, warm cache, and mixed read/write workloads
+      - Range selectivity from 0.01% through 100%
+
+  B3  Query operators
+      - Sort, Top-N, group cardinality, aggregate, and join build/probe sizes
+      - Memory consumption and spill behavior
+      - Estimate accuracy after cost-based planning exists
+
+  B4  Buffer pool and storage
+      - 10%, 25%, 50%, and 100% of working set
+      - Hit rate, eviction rate, dirty flushes, read/write amplification
+      - Fragmentation and vacuum effectiveness over churn workloads
+
+  B5  Durability and concurrency
+      - WAL/checkpoint overhead by durability mode
+      - Recovery time by database/WAL size
+      - Scaling across readers and writers with tail latency
+      - Long-running soak tests with crash/restart injection
+
+  B6  Comparative discipline
+      - Compare only equivalent durability and indexing configurations
+      - Publish workloads and scripts
+      - Track regressions with budgets in CI; never optimize away correctness
+
+----------------------------------------------------------------
+DELIBERATE NON-GOALS
+----------------------------------------------------------------
+- Shipping every post-v1 feature before the first stable release
+- SQL compatibility at the cost of a coherent ASL design
+- A custom binary wire protocol before HTTP profiling proves it necessary
+- Distributed execution before WAL, recovery, transactions, and replication
+- Lock-free or NUMA-specific optimization before representative benchmarks
+- Silent recovery that hides detected corruption or data loss
+- Depending on crates for core storage/query algorithms merely to add features
+
+----------------------------------------------------------------
+LONG-HORIZON STRETCH GOALS
+----------------------------------------------------------------
+- Adaptive radix tree or LSM index experiments beside the BTree
+- Learned cost/cardinality models guarded by deterministic fallbacks
+- Incremental materialized views and change-data capture streams
+- Temporal collections and time-travel queries backed by MVCC history
+- Tiered hot/cold storage and object-store snapshots
+- Compression for pages, documents, WAL, and network results
+- Content-addressed backup deduplication
+- NUMA-aware buffer pools and parallel vectorized execution
+- Embedded WASM functions with deterministic resource metering
+- Hybrid full-text, vector, structured, and geospatial retrieval
 
 ----------------------------------------------------------------
 SUGGESTED CRATES
 ----------------------------------------------------------------
-- none required for core engine
-- serde_json: optional result output formatting
-- clap: optional CLI argument parsing
-- rustyline: optional REPL line editing
-
-Everything else — storage, BTree, parser, binder, planner, executor — should
-remain hand-rolled unless there is a deliberate reason to change that.
+- Keep storage, WAL, BTree, parser, binder, planner, and executor algorithms
+  hand-rolled so their invariants remain visible and educational
+- Use mature crates at system boundaries where reimplementation creates risk:
+    clap             CLI parsing and stable help output
+    rustyline        REPL editing/history
+    serde/serde_json optional interoperability at the JSON boundary
+    rustls           TLS instead of custom cryptography
+    tracing          structured logs and spans
+    proptest         property tests for codecs and data structures
+    cargo-fuzz       fuzz targets for untrusted inputs
+- Every dependency needs a concrete benefit, license review, maintenance
+  check, and measurable compile/runtime impact
 
 ================================================================
-END OF v1.0.0 PLAN
+END OF ASDB IMPLEMENTATION ROADMAP
 ================================================================

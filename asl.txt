@@ -23,7 +23,7 @@ optional decoration (see STAGE SEPARATION below).
 SYNTAX CONVENTIONS
 ----------------------------------------------------------------
 - Keywords are lowercase
-- Field names are unquoted identifiers
+- Field names are identifiers; backticks quote reserved words: `order`
 - String literals are double-quoted: "alice"
 - Numbers are unquoted: 42, 3.14
 - Booleans: true, false
@@ -151,7 +151,7 @@ reading order and execution order identical.
 ----------------------------------------------------------------
 DATA MODEL
 ----------------------------------------------------------------
-shaydb stores collections of documents.
+asdb stores collections of documents.
 A document is a set of key-value pairs.
 Values can be:
     - Int        64-bit signed integer
@@ -332,8 +332,8 @@ JOIN STAGE
 ----------------------------------------------------------------
 FIELD EXPRESSIONS
 ----------------------------------------------------------------
-Field expressions can appear in where, select, update set,
-and order stages.
+Field expressions can appear in where, select, and update set stages.
+The order stage currently accepts field names, not arbitrary expressions.
 
     Arithmetic:     +  -  *  /  %
     String concat:  field + " suffix"
@@ -348,7 +348,12 @@ SCHEMA DEFINITION
 ----------------------------------------------------------------
 Collections are created with a schema declaration.
 Schema is optional — schemaless documents are permitted —
-but declared fields are indexable and type-checked on insert.
+and scalar fields may be indexed whether or not they are declared.
+
+CURRENT RUNTIME LIMITATION:
+Schema declarations are parsed and duplicate field declarations are rejected,
+but schema metadata is not yet persisted. Field types, required, and unique
+constraints are therefore not enforced on insert in v1.0.0.
 
     create <collection> { <field>: <type>, ... }
 
@@ -370,12 +375,14 @@ but declared fields are indexable and type-checked on insert.
 INDEX DEFINITION
 ----------------------------------------------------------------
     create index on <collection>.<field>
-    create index on <collection>.<field>, <field>   (composite)
     drop index on <collection>.<field>
 
     Examples:
         create index on users.id
-        create index on orders.user_id, orders.status
+
+The parser recognizes composite index declarations so that syntax is reserved,
+but the v1.0.0 binder rejects them because the runtime index layer supports
+only one field per index.
 
 ----------------------------------------------------------------
 RESULT FORMAT
@@ -401,6 +408,35 @@ Error responses:
     }
 
 ----------------------------------------------------------------
+HTTP INTERFACE
+----------------------------------------------------------------
+The current executable serves ASL over HTTP:
+
+    GET  /health
+        Returns { "status": "ok" }.
+
+    POST /query
+        Accepts one ASL statement as a Content-Length request body and returns
+        one of the JSON shapes above.
+
+The server is intentionally minimal: it has no authentication, TLS,
+keep-alive, or chunked request-body support. Database execution is serialized
+through one mutex. Bind it to localhost or keep it on a private network; it is
+not intended to be exposed directly to the public internet.
+
+----------------------------------------------------------------
+TTL POLICIES
+----------------------------------------------------------------
+The server CLI accepts repeatable expiration policies:
+
+    --ttl <collection>.<field>=<duration>
+
+Durations use an integer followed by s, m, h, or d. The field must contain an
+Int holding Unix epoch milliseconds. A background sweeper deletes documents
+whose timestamp is older than the policy duration. Documents without the
+field are not expired.
+
+----------------------------------------------------------------
 EXAMPLES — FULL QUERIES
 ----------------------------------------------------------------
 
@@ -411,7 +447,7 @@ from users | where age >= 18 and country == "CA" | order name asc | select name,
 from products | order price desc | offset 0 | limit 25 | select name, price
 
 -- Order summary per user
-from orders | group user_id | select user_id, count, sum total | order sum desc
+from orders | group user_id | select user_id, count, sum total as total_sum | order total_sum desc
 
 -- Join orders with users
 from orders | where status == "shipped" | join users on user_id == id | select name, total, shipped_at
