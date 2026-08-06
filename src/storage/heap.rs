@@ -68,7 +68,19 @@ pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 HeapFile: a chain of slotted pages anchored at `root`, with `last_page`
 cached for O(1) appends.
 
-owns its BufferPool for v1. when phase 2 introduces collections (multiple
+DOES NOT OWN A BUFFER POOL. Every method that touches storage takes
+`bp: &mut BufferPool`. This is the "multiple heaps sharing one pool" change
+this comment used to anticipate.
+
+It is not tidiness. When each HeapFile owned a pool over the same file, two
+collections got two DiskManagers with independent num_pages counters and
+handed out the SAME page id to both, and the per-pool caches hid it until a
+restart. tests/multi_collection.rs is the regression test. It is also three
+separate performance bugs: opening a pool per document was the dominant cost
+in insert, delete, and index fetch.
+
+Historical note, kept because it was true when written: originally owned its
+BufferPool for v1. when phase 2 introduces collections (multiple
 heaps sharing one pool), this will become a borrow / shared handle.
 
 why cache last_page? without it, every insert walks the chain from root
@@ -81,7 +93,6 @@ delete. that wastes space until compaction. compaction is out of scope
 for v1.
 */
 pub struct HeapFile {
-    bp: BufferPool,
     root: PageId,
     last_page: PageId,
 }
@@ -94,9 +105,9 @@ impl HeapFile {
     `bp.new_page(...)` returns (PageId, R) where R is whatever the closure
     returns. we ignore the unit return with `_` and just keep the page id.
     */
-    pub fn create(mut bp: BufferPool) -> std::io::Result<Self> {
+    pub fn create(bp: &mut BufferPool) -> std::io::Result<Self> {
         let (root, _) = bp.new_page(|page| init_heap_page(page))?;
-        Ok(HeapFile { bp, root, last_page: root })
+        Ok(HeapFile { root, last_page: root })
     }
 
     /*
@@ -110,9 +121,9 @@ impl HeapFile {
     IO (chain walk), so it returns Result. callers that already had a
     HeapFile::open(bp, root) need to adapt.
     */
-    pub fn open(mut bp: BufferPool, root: PageId) -> std::io::Result<Self> {
-        let last_page = find_last_page(&mut bp, root)?;
-        Ok(HeapFile { bp, root, last_page })
+    pub fn open(bp: &mut BufferPool, root: PageId) -> std::io::Result<Self> {
+        let last_page = find_last_page(bp, root)?;
+        Ok(HeapFile { root, last_page })
     }
 
     pub fn root(&self) -> PageId {
@@ -134,7 +145,7 @@ impl HeapFile {
     page dirty even if we don't actually mutate. spending a cheap read to
     avoid an extra disk flush on a full tail is a good trade.
     */
-    pub fn insert(&mut self, data: &[u8]) -> std::io::Result<DocId> {
+    pub fn insert(&mut self, bp: &mut BufferPool, data: &[u8]) -> std::io::Result<DocId> {
         assert!(!data.is_empty(), "empty records are not supported");
         assert!(
             data.len() <= MAX_RECORD_SIZE,
@@ -144,20 +155,20 @@ impl HeapFile {
 
         // fast path: tail page has room
         let tail = self.last_page;
-        let space = self.bp.with_page(tail, page_free_space)?;
+        let space = bp.with_page(tail, page_free_space)?;
         if space >= needed {
-            let slot = self.bp.with_page_mut(tail, |page| {
+            let slot = bp.with_page_mut(tail, |page| {
                 try_insert_in_page(page, data).expect("space check said it fits")
             })?;
             return Ok((tail, slot));
         }
 
         // slow path: extend the chain with a new tail
-        let (new_id, slot) = self.bp.new_page(|page| {
+        let (new_id, slot) = bp.new_page(|page| {
             init_heap_page(page);
             try_insert_in_page(page, data).expect("fresh page must fit")
         })?;
-        self.bp.with_page_mut(tail, |page| {
+        bp.with_page_mut(tail, |page| {
             write_u64(&mut page.data, HEADER_NEXT_OFFSET, new_id);
         })?;
         self.last_page = new_id;
@@ -171,9 +182,9 @@ impl HeapFile {
     out a reference into a buffer pool frame across function boundaries
     (see with_page docs in buffer_pool.rs for why).
     */
-    pub fn read(&mut self, doc_id: DocId) -> std::io::Result<Option<Vec<u8>>> {
+    pub fn read(&self, bp: &mut BufferPool, doc_id: DocId) -> std::io::Result<Option<Vec<u8>>> {
         let (pid, slot_id) = doc_id;
-        self.bp.with_page(pid, |page| read_slot(page, slot_id))
+        bp.with_page(pid, |page| read_slot(page, slot_id))
     }
 
     /*
@@ -182,9 +193,9 @@ impl HeapFile {
 
     if the slot is already a tombstone, this is a no-op.
     */
-    pub fn delete(&mut self, doc_id: DocId) -> std::io::Result<()> {
+    pub fn delete(&self, bp: &mut BufferPool, doc_id: DocId) -> std::io::Result<()> {
         let (pid, slot_id) = doc_id;
-        self.bp.with_page_mut(pid, |page| {
+        bp.with_page_mut(pid, |page| {
             tombstone_slot(page, slot_id);
         })
     }
@@ -200,11 +211,45 @@ impl HeapFile {
     running as long as the pattern matches, here as long as `current` has a
     Some(PageId).
     */
-    pub fn scan_all(&mut self) -> std::io::Result<Vec<(DocId, Vec<u8>)>> {
+    /*
+    scan_page: read ONE page of the chain, returning its live records and the
+    id of the next page.
+
+    This is scan_all's loop body, exposed so a caller can drive the walk itself
+    instead of receiving the whole collection at once. That is what lets the
+    query executor stream: `from events | limit 25` over a million documents
+    stops after the first page rather than materialising a million records.
+
+    A PAGE at a time rather than a RECORD at a time is deliberate. The unit of
+    IO is a page, so fetching one record per call would re-pin and re-read the
+    same frame for every slot on it. A page of records is a small, bounded
+    buffer and it keeps the pin held exactly once.
+
+    Returns None for the next page when this is the tail.
+    */
+    pub fn scan_page(
+        &self,
+        bp: &mut BufferPool,
+        page_id: PageId,
+    ) -> std::io::Result<(Vec<(DocId, Vec<u8>)>, Option<PageId>)> {
+        bp.with_page(page_id, |page| {
+            let mut recs: Vec<(DocId, Vec<u8>)> = Vec::new();
+            let slot_count = read_u16(&page.data, HEADER_SLOT_COUNT_OFFSET);
+            for s in 0..slot_count {
+                if let Some(bytes) = read_slot(page, s) {
+                    recs.push(((page_id, s), bytes));
+                }
+            }
+            let next = read_u64(&page.data, HEADER_NEXT_OFFSET);
+            (recs, if next == NO_NEXT { None } else { Some(next) })
+        })
+    }
+
+    pub fn scan_all(&self, bp: &mut BufferPool) -> std::io::Result<Vec<(DocId, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut current: Option<PageId> = Some(self.root);
         while let Some(pid) = current {
-            let (records, next) = self.bp.with_page(pid, |page| {
+            let (records, next) = bp.with_page(pid, |page| {
                 let mut recs: Vec<(DocId, Vec<u8>)> = Vec::new();
                 let slot_count = read_u16(&page.data, HEADER_SLOT_COUNT_OFFSET);
                 for s in 0..slot_count {
@@ -225,8 +270,8 @@ impl HeapFile {
     flush: push all dirty frames to disk. call before drop if you want
     explicit error handling (Drop in BufferPool swallows errors).
     */
-    pub fn flush(&mut self) -> std::io::Result<()> {
-        self.bp.flush_all()
+    pub fn flush(&self, bp: &mut BufferPool) -> std::io::Result<()> {
+        bp.flush_all()
     }
 }
 
@@ -377,39 +422,44 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    fn make_heap(capacity: usize) -> (HeapFile, NamedTempFile) {
+    /*
+    Returns the pool alongside the heap now that HeapFile does not own one. The
+    NamedTempFile must stay bound in the caller too: dropping it deletes the
+    file out from under the pool.
+    */
+    fn make_heap(capacity: usize) -> (HeapFile, BufferPool, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
         let disk = DiskManager::open(tmp.path()).unwrap();
-        let bp = BufferPool::new(disk, capacity);
-        let heap = HeapFile::create(bp).unwrap();
-        (heap, tmp)
+        let mut bp = BufferPool::new(disk, capacity);
+        let heap = HeapFile::create(&mut bp).unwrap();
+        (heap, bp, tmp)
     }
 
     #[test]
     fn test_insert_read_one() {
-        let (mut heap, _tmp) = make_heap(4);
-        let id = heap.insert(b"hello world").unwrap();
-        let got = heap.read(id).unwrap();
+        let (mut heap, mut bp, _tmp) = make_heap(4);
+        let id = heap.insert(&mut bp, b"hello world").unwrap();
+        let got = heap.read(&mut bp, id).unwrap();
         assert_eq!(got.as_deref(), Some(&b"hello world"[..]));
     }
 
     #[test]
     #[should_panic(expected = "empty records are not supported")]
     fn test_insert_empty_record_panics() {
-        let (mut heap, _tmp) = make_heap(4);
-        heap.insert(b"").unwrap();
+        let (mut heap, mut bp, _tmp) = make_heap(4);
+        heap.insert(&mut bp, b"").unwrap();
     }
 
     #[test]
     fn test_insert_many_single_page() {
-        let (mut heap, _tmp) = make_heap(4);
+        let (mut heap, mut bp, _tmp) = make_heap(4);
         let mut ids = Vec::new();
         for i in 0u32..50 {
             let payload = format!("record-{}", i);
-            ids.push((heap.insert(payload.as_bytes()).unwrap(), payload));
+            ids.push((heap.insert(&mut bp, payload.as_bytes()).unwrap(), payload));
         }
         for (id, expected) in &ids {
-            let got = heap.read(*id).unwrap().unwrap();
+            let got = heap.read(&mut bp, *id).unwrap().unwrap();
             assert_eq!(&got[..], expected.as_bytes());
         }
     }
@@ -420,14 +470,14 @@ mod tests {
     */
     #[test]
     fn test_multi_page_chain() {
-        let (mut heap, _tmp) = make_heap(4);
+        let (mut heap, mut bp, _tmp) = make_heap(4);
         // ~500 bytes each, 1000 records -> well past one page
         let payload = vec![0xCDu8; 500];
         let mut ids = Vec::new();
         for _ in 0..1000 {
-            ids.push(heap.insert(&payload).unwrap());
+            ids.push(heap.insert(&mut bp, &payload).unwrap());
         }
-        let all = heap.scan_all().unwrap();
+        let all = heap.scan_all(&mut bp).unwrap();
         assert_eq!(all.len(), 1000);
         // every record should equal `payload`
         for (_, bytes) in &all {
@@ -437,18 +487,18 @@ mod tests {
 
     #[test]
     fn test_delete_tombstones() {
-        let (mut heap, _tmp) = make_heap(4);
-        let a = heap.insert(b"alpha").unwrap();
-        let b = heap.insert(b"bravo").unwrap();
-        let c = heap.insert(b"charlie").unwrap();
+        let (mut heap, mut bp, _tmp) = make_heap(4);
+        let a = heap.insert(&mut bp, b"alpha").unwrap();
+        let b = heap.insert(&mut bp, b"bravo").unwrap();
+        let c = heap.insert(&mut bp, b"charlie").unwrap();
 
-        heap.delete(b).unwrap();
+        heap.delete(&mut bp, b).unwrap();
 
-        assert_eq!(heap.read(a).unwrap().as_deref(), Some(&b"alpha"[..]));
-        assert_eq!(heap.read(b).unwrap(), None);
-        assert_eq!(heap.read(c).unwrap().as_deref(), Some(&b"charlie"[..]));
+        assert_eq!(heap.read(&mut bp, a).unwrap().as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(heap.read(&mut bp, b).unwrap(), None);
+        assert_eq!(heap.read(&mut bp, c).unwrap().as_deref(), Some(&b"charlie"[..]));
 
-        let all = heap.scan_all().unwrap();
+        let all = heap.scan_all(&mut bp).unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -469,27 +519,27 @@ mod tests {
         let saved_ids;
         {
             let disk = DiskManager::open(tmp.path()).unwrap();
-            let bp = BufferPool::new(disk, 4);
-            let mut heap = HeapFile::create(bp).unwrap();
+            let mut bp = BufferPool::new(disk, 4);
+            let mut heap = HeapFile::create(&mut bp).unwrap();
             root = heap.root();
             saved_ids = vec![
-                heap.insert(b"persist me").unwrap(),
-                heap.insert(b"and me too").unwrap(),
+                heap.insert(&mut bp, b"persist me").unwrap(),
+                heap.insert(&mut bp, b"and me too").unwrap(),
             ];
-            heap.flush().unwrap();
+            heap.flush(&mut bp).unwrap();
         }
 
         // session 2: reopen same file, same root
         let disk = DiskManager::open(tmp.path()).unwrap();
-        let bp = BufferPool::new(disk, 4);
-        let mut heap = HeapFile::open(bp, root).unwrap();
-        assert_eq!(heap.read(saved_ids[0]).unwrap().as_deref(), Some(&b"persist me"[..]));
-        assert_eq!(heap.read(saved_ids[1]).unwrap().as_deref(), Some(&b"and me too"[..]));
+        let mut bp = BufferPool::new(disk, 4);
+        let mut heap = HeapFile::open(&mut bp, root).unwrap();
+        assert_eq!(heap.read(&mut bp, saved_ids[0]).unwrap().as_deref(), Some(&b"persist me"[..]));
+        assert_eq!(heap.read(&mut bp, saved_ids[1]).unwrap().as_deref(), Some(&b"and me too"[..]));
 
         // a fresh insert after reopen should land on the recovered tail page
         // and be readable like any other record.
-        let new_id = heap.insert(b"post-reopen").unwrap();
-        assert_eq!(heap.read(new_id).unwrap().as_deref(), Some(&b"post-reopen"[..]));
+        let new_id = heap.insert(&mut bp, b"post-reopen").unwrap();
+        assert_eq!(heap.read(&mut bp, new_id).unwrap().as_deref(), Some(&b"post-reopen"[..]));
     }
 
     /*
@@ -500,21 +550,21 @@ mod tests {
     */
     #[test]
     fn test_bulk_insert_delete_scan() {
-        let (mut heap, _tmp) = make_heap(8);
+        let (mut heap, mut bp, _tmp) = make_heap(8);
         let mut ids = Vec::new();
         for i in 0u32..2000 {
             // variable length 1..=200 bytes, content varies with i
             let len = 1 + (i as usize % 200);
             let payload: Vec<u8> = (0..len).map(|j| ((i + j as u32) & 0xff) as u8).collect();
-            ids.push((heap.insert(&payload).unwrap(), payload));
+            ids.push((heap.insert(&mut bp, &payload).unwrap(), payload));
         }
         // delete every 7th record
         for (idx, (id, _)) in ids.iter().enumerate() {
             if idx % 7 == 0 {
-                heap.delete(*id).unwrap();
+                heap.delete(&mut bp, *id).unwrap();
             }
         }
-        let alive = heap.scan_all().unwrap();
+        let alive = heap.scan_all(&mut bp).unwrap();
         let expected_alive = ids.iter().enumerate().filter(|(i, _)| i % 7 != 0).count();
         assert_eq!(alive.len(), expected_alive);
     }
@@ -522,27 +572,27 @@ mod tests {
     #[test]
     #[ignore = "phase 1 stress test: inserts 100k variable-length records"]
     fn stress_insert_100k_variable_records_delete_subset_scan() {
-        let (mut heap, _tmp) = make_heap(128);
+        let (mut heap, mut bp, _tmp) = make_heap(128);
         let mut ids = Vec::with_capacity(100_000);
 
         for i in 0u32..100_000 {
             let payload = stress_payload(i);
-            let id = heap.insert(&payload).unwrap();
+            let id = heap.insert(&mut bp, &payload).unwrap();
             ids.push((id, payload));
         }
 
         for (idx, (id, _)) in ids.iter().enumerate() {
             if idx % 7 == 0 {
-                heap.delete(*id).unwrap();
+                heap.delete(&mut bp, *id).unwrap();
             }
         }
 
-        let alive = heap.scan_all().unwrap();
+        let alive = heap.scan_all(&mut bp).unwrap();
         let expected_alive = ids.iter().enumerate().filter(|(i, _)| i % 7 != 0).count();
         assert_eq!(alive.len(), expected_alive);
 
         for (idx, (id, expected)) in ids.iter().enumerate().step_by(997) {
-            let got = heap.read(*id).unwrap();
+            let got = heap.read(&mut bp, *id).unwrap();
             if idx % 7 == 0 {
                 assert_eq!(got, None);
             } else {

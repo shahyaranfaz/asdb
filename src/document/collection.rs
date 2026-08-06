@@ -16,7 +16,7 @@ Documents into heap records and back.
 
 use super::{deserialize_document, serialize_document, DecodeError, Document};
 
-use crate::storage::{DocId, HeapFile, PageId};
+use crate::storage::{BufferPool, DocId, HeapFile, PageId};
 
 use std::fmt;
 
@@ -95,9 +95,9 @@ impl Collection {
     DocId is still the storage-level address: (page_id, slot_id). Higher layers
     can wrap this in a richer type later if we want stable public ids.
     */
-    pub fn insert(&mut self, doc: &Document) -> CollectionResult<DocId> {
+    pub fn insert(&mut self, bp: &mut BufferPool, doc: &Document) -> CollectionResult<DocId> {
         let bytes = serialize_document(doc);
-        Ok(self.heap.insert(&bytes)?)
+        Ok(self.heap.insert(bp, &bytes)?)
     }
 
     /*
@@ -106,15 +106,15 @@ impl Collection {
     None means the slot does not exist or has been deleted. Some(doc) means the
     bytes existed and decoded cleanly as a Document.
     */
-    pub fn get(&mut self, doc_id: DocId) -> CollectionResult<Option<Document>> {
-        let Some(bytes) = self.heap.read(doc_id)? else {
+    pub fn get(&self, bp: &mut BufferPool, doc_id: DocId) -> CollectionResult<Option<Document>> {
+        let Some(bytes) = self.heap.read(bp, doc_id)? else {
             return Ok(None);
         };
         Ok(Some(deserialize_document(&bytes)?))
     }
 
-    pub fn delete(&mut self, doc_id: DocId) -> CollectionResult<()> {
-        Ok(self.heap.delete(doc_id)?)
+    pub fn delete(&self, bp: &mut BufferPool, doc_id: DocId) -> CollectionResult<()> {
+        Ok(self.heap.delete(bp, doc_id)?)
     }
 
     /*
@@ -124,8 +124,32 @@ impl Collection {
     eventually get a streaming version so big scans do not allocate everything
     at once.
     */
-    pub fn scan(&mut self) -> CollectionResult<Vec<(DocId, Document)>> {
-        let records = self.heap.scan_all()?;
+    /// The first page of this collection's chain, where a streaming scan starts.
+    pub fn first_page(&self) -> PageId {
+        self.heap.root()
+    }
+
+    /*
+    scan_page: one page of documents, plus where to go next.
+
+    The streaming counterpart to scan(). Decodes the same way, just a page at a
+    time, so a caller can stop early without having read the whole collection.
+    */
+    pub fn scan_page(
+        &self,
+        bp: &mut BufferPool,
+        page_id: PageId,
+    ) -> CollectionResult<(Vec<(DocId, Document)>, Option<PageId>)> {
+        let (records, next) = self.heap.scan_page(bp, page_id)?;
+        let mut docs = Vec::with_capacity(records.len());
+        for (doc_id, bytes) in records {
+            docs.push((doc_id, deserialize_document(&bytes)?));
+        }
+        Ok((docs, next))
+    }
+
+    pub fn scan(&self, bp: &mut BufferPool) -> CollectionResult<Vec<(DocId, Document)>> {
+        let records = self.heap.scan_all(bp)?;
         let mut docs = Vec::with_capacity(records.len());
         for (doc_id, bytes) in records {
             docs.push((doc_id, deserialize_document(&bytes)?));
@@ -133,8 +157,8 @@ impl Collection {
         Ok(docs)
     }
 
-    pub fn flush(&mut self) -> CollectionResult<()> {
-        Ok(self.heap.flush()?)
+    pub fn flush(&self, bp: &mut BufferPool) -> CollectionResult<()> {
+        Ok(self.heap.flush(bp)?)
     }
 }
 
@@ -146,29 +170,29 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    fn make_collection(capacity: usize) -> (Collection, NamedTempFile) {
+    fn make_collection(capacity: usize) -> (Collection, BufferPool, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
         let disk = DiskManager::open(tmp.path()).unwrap();
-        let bp = BufferPool::new(disk, capacity);
-        let heap = HeapFile::create(bp).unwrap();
-        (Collection::create(heap), tmp)
+        let mut bp = BufferPool::new(disk, capacity);
+        let heap = HeapFile::create(&mut bp).unwrap();
+        (Collection::create(heap), bp, tmp)
     }
 
     #[test]
     fn test_insert_get_delete_document() {
-        let (mut collection, _tmp) = make_collection(4);
+        let (mut collection, mut bp, _tmp) = make_collection(4);
         let doc = user_doc(1, "alice", 25);
 
-        let id = collection.insert(&doc).unwrap();
-        assert_eq!(collection.get(id).unwrap(), Some(doc));
+        let id = collection.insert(&mut bp, &doc).unwrap();
+        assert_eq!(collection.get(&mut bp, id).unwrap(), Some(doc));
 
-        collection.delete(id).unwrap();
-        assert_eq!(collection.get(id).unwrap(), None);
+        collection.delete(&mut bp, id).unwrap();
+        assert_eq!(collection.get(&mut bp, id).unwrap(), None);
     }
 
     #[test]
     fn test_scan_documents() {
-        let (mut collection, _tmp) = make_collection(4);
+        let (mut collection, mut bp, _tmp) = make_collection(4);
         let docs = vec![
             user_doc(1, "alice", 25),
             user_doc(2, "bob", 17),
@@ -176,11 +200,11 @@ mod tests {
         ];
 
         for doc in &docs {
-            collection.insert(doc).unwrap();
+            collection.insert(&mut bp, doc).unwrap();
         }
 
         let scanned: Vec<Document> = collection
-            .scan()
+            .scan(&mut bp)
             .unwrap()
             .into_iter()
             .map(|(_, doc)| doc)
@@ -201,20 +225,20 @@ mod tests {
 
         {
             let disk = DiskManager::open(tmp.path()).unwrap();
-            let bp = BufferPool::new(disk, 4);
-            let heap = HeapFile::create(bp).unwrap();
+            let mut bp = BufferPool::new(disk, 4);
+            let heap = HeapFile::create(&mut bp).unwrap();
             let mut collection = Collection::create(heap);
             root = collection.root();
-            saved_id = collection.insert(&saved_doc).unwrap();
-            collection.flush().unwrap();
+            saved_id = collection.insert(&mut bp, &saved_doc).unwrap();
+            collection.flush(&mut bp).unwrap();
         }
 
         let disk = DiskManager::open(tmp.path()).unwrap();
-        let bp = BufferPool::new(disk, 4);
-        let heap = HeapFile::open(bp, root).unwrap();
-        let mut collection = Collection::open(heap);
+        let mut bp = BufferPool::new(disk, 4);
+        let heap = HeapFile::open(&mut bp, root).unwrap();
+        let collection = Collection::open(heap);
 
-        assert_eq!(collection.get(saved_id).unwrap(), Some(saved_doc));
+        assert_eq!(collection.get(&mut bp, saved_id).unwrap(), Some(saved_doc));
     }
 
     fn user_doc(id: i64, name: &str, age: i64) -> Document {

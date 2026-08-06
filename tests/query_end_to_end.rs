@@ -463,3 +463,146 @@ fn test_join_with_a_filter_before_it() {
     assert_eq!(rows.len(), 1);
     assert_eq!(text(&rows[0], "name"), "cara");
 }
+
+/*
+One-sided range predicates now plan as IndexScan with a synthesised open end
+(planner::close_bounds). The risk in doing that is under-fetching: an index
+scan MUST return a superset of the matches, or rows silently disappear. These
+tests assert the indexed and unindexed paths agree exactly.
+*/
+
+fn ages_matching(db: &mut Database, query: &str) -> Vec<i64> {
+    let mut ages: Vec<i64> = docs(run(db, query)).iter().map(|d| int(d, "age")).collect();
+    ages.sort();
+    ages
+}
+
+#[test]
+fn test_one_sided_ranges_agree_with_and_without_an_index() {
+    let tmp = TempDb::new("onesided");
+    let mut db = tmp.open();
+    seed(&mut db);
+
+    let queries = [
+        "from users | where age > 17 | select age",
+        "from users | where age >= 17 | select age",
+        "from users | where age < 30 | select age",
+        "from users | where age <= 30 | select age",
+        "from users | where age > 100 | select age",
+        "from users | where age < 0 | select age",
+    ];
+
+    let before: Vec<Vec<i64>> = queries.iter().map(|q| ages_matching(&mut db, q)).collect();
+    db.create_index("users", "age").unwrap();
+    let after: Vec<Vec<i64>> = queries.iter().map(|q| ages_matching(&mut db, q)).collect();
+
+    for (i, query) in queries.iter().enumerate() {
+        assert_eq!(before[i], after[i], "index changed the answer for: {query}");
+    }
+    // sanity: the corpus really does exercise these
+    assert_eq!(before[0], vec![25, 30, 45]);
+    assert_eq!(before[1], vec![17, 17, 25, 30, 45]);
+}
+
+#[test]
+fn test_one_sided_range_actually_uses_the_index() {
+    // the previous test would still pass if the planner ignored the index, so
+    // assert the plan shape directly.
+    use asdb::query::PhysicalOp;
+
+    let tmp = TempDb::new("onesidedplan");
+    let mut db = tmp.open();
+    seed(&mut db);
+    db.create_index("users", "age").unwrap();
+
+    let tokens = tokenize("from users | where age > 17").unwrap();
+    let statement = parse(&tokens).unwrap();
+    let BoundStatement::Pipeline(pipeline) = bind(&db, statement).unwrap() else {
+        panic!("expected a pipeline");
+    };
+
+    match plan(&db, &pipeline).unwrap() {
+        // exclusive bound over-fetches, so the Filter must be KEPT
+        PhysicalOp::Filter { input, .. } => {
+            assert!(
+                matches!(*input, PhysicalOp::IndexScan { .. }),
+                "expected Filter(IndexScan), got {input:?}"
+            );
+        }
+        other => panic!("expected Filter(IndexScan), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_string_ranges_still_fall_back_to_a_scan() {
+    // there is no greatest string, so close_bounds declines and the planner
+    // must not emit a half-open IndexScan.
+    use asdb::query::PhysicalOp;
+
+    let tmp = TempDb::new("stringrange");
+    let mut db = tmp.open();
+    seed(&mut db);
+    db.create_index("users", "name").unwrap();
+
+    let tokens = tokenize(r#"from users | where name > "b""#).unwrap();
+    let statement = parse(&tokens).unwrap();
+    let BoundStatement::Pipeline(pipeline) = bind(&db, statement).unwrap() else {
+        panic!("expected a pipeline");
+    };
+    match plan(&db, &pipeline).unwrap() {
+        PhysicalOp::Filter { input, .. } => {
+            assert!(matches!(*input, PhysicalOp::SeqScan { .. }), "got {input:?}");
+        }
+        other => panic!("expected Filter(SeqScan), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ttl_shaped_delete_agrees_with_and_without_an_index() {
+    /*
+    The sweeper's exact query shape, which is what motivated closing one-sided
+    bounds. Run it twice over identical data, once unindexed and once indexed,
+    and require the same rows to disappear.
+    */
+    let tmp_a = TempDb::new("ttl_noidx");
+    let tmp_b = TempDb::new("ttl_idx");
+    let mut a = tmp_a.open();
+    let mut b = tmp_b.open();
+
+    for db in [&mut a, &mut b] {
+        db.create_collection("snaps").unwrap();
+        for i in 0..40i64 {
+            let mut doc = Document::new();
+            doc.insert("n".to_string(), Value::Int(i));
+            doc.insert("receivedAt".to_string(), Value::Int(1_000 + i * 10));
+            db.insert_doc("snaps", &doc).unwrap();
+        }
+    }
+    // a document with no timestamp must survive both paths
+    let mut orphan = Document::new();
+    orphan.insert("n".to_string(), Value::Int(999));
+    a.insert_doc("snaps", &orphan).unwrap();
+    b.insert_doc("snaps", &orphan).unwrap();
+
+    b.create_index("snaps", "receivedAt").unwrap();
+
+    let cutoff = "from snaps | where receivedAt < 1200 | delete";
+    let removed_a = match run(&mut a, cutoff) {
+        QueryOutput::Affected(n) => n,
+        other => panic!("{other:?}"),
+    };
+    let removed_b = match run(&mut b, cutoff) {
+        QueryOutput::Affected(n) => n,
+        other => panic!("{other:?}"),
+    };
+
+    assert_eq!(removed_a, removed_b, "index changed how many rows expired");
+    assert_eq!(removed_a, 20, "receivedAt 1000..1190 step 10 is 20 documents");
+
+    let mut left_a: Vec<i64> = a.scan_collection("snaps").unwrap().iter().map(|(_, d)| int(d, "n")).collect();
+    let mut left_b: Vec<i64> = b.scan_collection("snaps").unwrap().iter().map(|(_, d)| int(d, "n")).collect();
+    left_a.sort();
+    left_b.sort();
+    assert_eq!(left_a, left_b, "index changed which rows expired");
+    assert!(left_a.contains(&999), "the untimestamped document must never expire");
+}

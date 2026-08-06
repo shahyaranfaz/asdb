@@ -2,16 +2,15 @@
 multi_collection.rs: a latent storage-aliasing bug, pinned down before the
 executor can trip over it.
 
-STATUS: this test FAILS today. It is #[ignore]d so it does not break the
-suite, not because it is flaky. It is here as a specification of the problem,
-with the fix deliberately left out because the fix is a design change to
-Database and Catalog that should be reviewed on its own.
+STATUS: FIXED, and this test now passes. Kept as the regression guard, with
+the original diagnosis intact because the same root cause produced three
+separate performance bugs as well (see the note at the bottom).
 
-WHAT IS WRONG
+WHAT WAS WRONG
 
-Catalog opens a brand new DiskManager and BufferPool on every call.
-create_collection, open_collection and flush each do it, and the returned
-Collection owns that pool. DiskManager caches num_pages from the file length
+Catalog opened a brand new DiskManager and BufferPool on every call.
+create_collection, open_collection and flush each did it, and the returned
+Collection owned that pool. DiskManager caches num_pages from the file length
 at open time. So with two Collection handles alive at once:
 
   Catalog::create          allocates page 0, file is 1 page
@@ -26,37 +25,34 @@ serves reads from its own cached frame, so both collections read back exactly
 what they wrote. The assertions before the restart below pass even on the
 broken tree. The damage only appears once the caches are gone.
 
-Measured on this commit: collection a comes back with 206 documents, every
-one of them carrying b's tag. a's page chain had been rewritten to walk into
-b's pages.
+Measured before the fix: collection a came back with 206 documents, every one
+of them carrying b's tag. a's page chain had been rewritten to walk into b's
+pages.
 
-WHY Database DOES NOT HIT THIS TODAY
-
-It is worth being precise, because the facade looks fine. Database::insert_doc
-and friends open a collection, do one operation, flush, and drop it before the
-next call. Nothing ever holds two handles at once, so the allocation windows
-never overlap and the same test written against Database passes.
-
-The exposure is the LAYER BENEATH, which is public API. Any caller that holds
-two Collection handles simultaneously hits this, and the query executor is
-going to be exactly that caller: a hash join reads two collections at once by
-definition. So this wants fixing before 5.6, not after.
-
-THE SHAPE OF A FIX
+THE FIX
 
 One DiskManager and one BufferPool for the whole database, owned by Database,
 with HeapFile and Collection taking `bp: &mut BufferPool` per call instead of
-owning one. The alternatives are a shared Rc<RefCell<BufferPool>>, which moves
-borrow checking to runtime and turns a nested access into a panic, or holding
-a &'a mut borrow in the struct, which makes two live collections a compile
-error and so rules out the join that motivated this.
+owning one. The alternatives were a shared Rc<RefCell<BufferPool>>, which
+moves borrow checking to runtime and turns a nested access into a panic, or
+holding a &'a mut borrow in the struct, which makes two live collections a
+compile error and so rules out the hash join that motivated this.
 
-Note also that Catalog::flush writes page 0 through its own DiskManager,
-outside any pool. That one is safe as long as nothing else ever allocates
-page 0, but it is the same pattern and worth keeping in view.
+THE SAME ROOT CAUSE WAS ALSO THREE PERFORMANCE BUGS.
+
+Opening a pool per document, rather than per database, was the dominant cost
+in insert, delete, and index fetch. Before this: throughput flat at ~3000
+docs/s regardless of batch size, a 0.86s TTL sweep over 2400 documents, and an
+index scan 940x SLOWER than the sequential scan it was supposed to beat. One
+design decision, one correctness bug, three performance bugs.
+
+Note Catalog::flush still writes page 0 through its own DiskManager, outside
+the pool. That is safe because nothing else ever allocates page 0, but it is
+the same pattern and worth keeping in view.
 */
 
-use asdb::document::{Catalog, Document, Value};
+use asdb::database::Database;
+use asdb::document::{Document, Value};
 
 /*
 Documents are padded so a couple of hundred of them span many pages. Small
@@ -71,7 +67,6 @@ fn padded(tag: i64) -> Document {
 }
 
 #[test]
-#[ignore = "known latent bug: Catalog hands every Collection its own BufferPool"]
 fn two_live_collection_handles_survive_a_restart() {
     let path = std::env::temp_dir().join("asdb_multi_collection_test.db");
     let _ = std::fs::remove_file(&path);
@@ -79,31 +74,28 @@ fn two_live_collection_handles_survive_a_restart() {
     // write phase, with both handles alive and inserts interleaved so the two
     // collections grow the file alternately.
     {
-        let mut catalog = Catalog::create(&path).unwrap();
-        let mut a = catalog.create_collection("a").unwrap();
-        let mut b = catalog.create_collection("b").unwrap();
+        let mut db = Database::create(&path).unwrap();
+        db.create_collection("a").unwrap();
+        db.create_collection("b").unwrap();
 
         for _ in 0..200 {
-            a.insert(&padded(1)).unwrap();
-            b.insert(&padded(2)).unwrap();
+            db.insert_doc("a", &padded(1)).unwrap();
+            db.insert_doc("b", &padded(2)).unwrap();
         }
-        a.flush().unwrap();
-        b.flush().unwrap();
-        catalog.flush().unwrap();
+        db.flush().unwrap();
 
         // Both look correct HERE, before the caches are dropped. These two
-        // assertions pass even on the broken tree, which is exactly why the
+        // assertions passed even on the broken tree, which is exactly why the
         // restart below is the load-bearing part of this test.
-        assert_eq!(a.scan().unwrap().len(), 200);
-        assert_eq!(b.scan().unwrap().len(), 200);
+        assert_eq!(db.scan_collection("a").unwrap().len(), 200);
+        assert_eq!(db.scan_collection("b").unwrap().len(), 200);
     }
 
     // read phase, with every cache gone.
-    let catalog = Catalog::open(&path).unwrap();
-    let mut a = catalog.open_collection("a").unwrap();
-    let mut b = catalog.open_collection("b").unwrap();
-    let scan_a = a.scan().unwrap();
-    let scan_b = b.scan().unwrap();
+    let mut db = Database::open(&path).unwrap();
+    let scan_a = db.scan_collection("a").unwrap();
+    let scan_b = db.scan_collection("b").unwrap();
+    drop(db);
     let _ = std::fs::remove_file(&path);
 
     let wrong_a = scan_a.iter().filter(|(_, d)| d.get("tag") != Some(&Value::Int(1))).count();
@@ -119,14 +111,11 @@ fn two_live_collection_handles_survive_a_restart() {
 }
 
 /*
-The same scenario through the Database facade, which PASSES. Kept alongside
-the failing test so the boundary is documented rather than rediscovered: the
-facade is safe because it never holds two handles, and that is the only reason.
+The same scenario driven document by document rather than in one batch, so the
+allocation windows interleave as finely as possible.
 */
 #[test]
-fn database_facade_is_not_affected() {
-    use asdb::database::Database;
-
+fn interleaved_single_writes_also_survive() {
     let path = std::env::temp_dir().join("asdb_facade_test.db");
     let _ = std::fs::remove_file(&path);
 

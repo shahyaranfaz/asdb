@@ -28,15 +28,23 @@ impl<'a> IndexManager<'a> {
             btree.root()
         };
 
+        /*
+        Scan the collection BEFORE opening the btree. Both need the pool
+        mutably and BTree::open holds its borrow for as long as the btree
+        lives, so materialising the documents first ends the collection's
+        borrow and leaves the pool free.
+        */
+        let existing = self.catalog.open_collection(self.pool, collection)?;
+        let docs = existing.scan(self.pool)?;
+        existing.flush(self.pool)?;
+
         let mut btree = BTree::open(root, self.pool);
-        let mut existing = self.catalog.open_collection(collection)?;
-        for (doc_id, doc) in existing.scan()? {
+        for (doc_id, doc) in docs {
             if let Some(value) = doc.get(field) {
                 let key = serialize_key(value);
                 btree.insert(&key, doc_id)?;
             }
         }
-        existing.flush()?;
 
         self.catalog.indexes.insert(key, root);
         self.catalog.flush()?;
@@ -132,19 +140,33 @@ mod tests {
         doc
     }
 
-    fn make_pool(path: &std::path::Path) -> BufferPool {
+    /*
+    ONE catalog and ONE pool per test, in that order.
+
+    These used to call make_pool() repeatedly, building a fresh pool per
+    IndexManager while the Collection held yet another. That is the exact
+    aliasing the shared pool removed, so they now share one the way real
+    callers do.
+
+    The consequence shows up in the shape below: IndexManager borrows both the
+    catalog and the pool for its whole lifetime, so a Collection cannot be
+    touched while one is alive. Index work sits in its own scope, collection
+    work outside it. That is the borrow checker making "who is mutating storage
+    right now" explicit, which is the point of threading &mut.
+    */
+    fn open_catalog_and_pool(path: &std::path::Path) -> (Catalog, BufferPool) {
+        let catalog = Catalog::create(path).unwrap();
         let disk = DiskManager::open(path).unwrap();
-        BufferPool::new(disk, 64)
+        (catalog, BufferPool::new(disk, 64))
     }
 
     #[test]
     fn test_create_index_persists_catalog_entry() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        catalog.create_collection("users").unwrap();
+        let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
+        catalog.create_collection(&mut pool, "users").unwrap();
 
         {
-            let mut pool = make_pool(tmp.path());
             let mut indexes = IndexManager::new(&mut catalog, &mut pool);
             indexes.create("users", "age").unwrap();
         }
@@ -156,8 +178,7 @@ mod tests {
     #[test]
     fn test_create_index_rejects_missing_collection() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        let mut pool = make_pool(tmp.path());
+        let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
 
         assert!(matches!(
@@ -169,16 +190,14 @@ mod tests {
     #[test]
     fn test_create_index_backfills_existing_documents() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        let mut users = catalog.create_collection("users").unwrap();
+        let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
+        let mut users = catalog.create_collection(&mut pool, "users").unwrap();
 
         let alice = make_doc(1, 25, "alice");
         let bob = make_doc(2, 17, "bob");
-        let alice_id = users.insert(&alice).unwrap();
-        let bob_id = users.insert(&bob).unwrap();
-        users.flush().unwrap();
-
-        let mut pool = make_pool(tmp.path());
+        let alice_id = users.insert(&mut pool, &alice).unwrap();
+        let bob_id = users.insert(&mut pool, &bob).unwrap();
+        users.flush(&mut pool).unwrap();
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
         indexes.create("users", "age").unwrap();
 
@@ -189,11 +208,10 @@ mod tests {
     #[test]
     fn test_index_manager_insert_hook_search_and_range() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        let mut users = catalog.create_collection("users").unwrap();
-        users.flush().unwrap();
+        let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
+        let mut users = catalog.create_collection(&mut pool, "users").unwrap();
+        users.flush(&mut pool).unwrap();
         {
-            let mut pool = make_pool(tmp.path());
             let mut indexes = IndexManager::new(&mut catalog, &mut pool);
             indexes.create("users", "age").unwrap();
         }
@@ -207,11 +225,9 @@ mod tests {
 
         let mut ids = Vec::new();
         for doc in &docs {
-            ids.push(users.insert(doc).unwrap());
+            ids.push(users.insert(&mut pool, doc).unwrap());
         }
-        users.flush().unwrap();
-
-        let mut pool = make_pool(tmp.path());
+        users.flush(&mut pool).unwrap();
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
         for (doc, doc_id) in docs.iter().zip(ids.iter()) {
             indexes.on_insert("users", doc, *doc_id).unwrap();
@@ -228,38 +244,39 @@ mod tests {
     #[test]
     fn test_index_manager_delete_hook_removes_entry() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        let mut users = catalog.create_collection("users").unwrap();
-        users.flush().unwrap();
+        let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
+        let mut users = catalog.create_collection(&mut pool, "users").unwrap();
+        users.flush(&mut pool).unwrap();
         {
-            let mut pool = make_pool(tmp.path());
             let mut indexes = IndexManager::new(&mut catalog, &mut pool);
             indexes.create("users", "age").unwrap();
         }
 
         let doc = make_doc(1, 25, "alice");
-        let doc_id = users.insert(&doc).unwrap();
-        users.flush().unwrap();
+        let doc_id = users.insert(&mut pool, &doc).unwrap();
+        users.flush(&mut pool).unwrap();
 
-        let mut pool = make_pool(tmp.path());
+        {
+            let mut indexes = IndexManager::new(&mut catalog, &mut pool);
+            indexes.on_insert("users", &doc, doc_id).unwrap();
+            assert_eq!(indexes.search("users", "age", &Value::Int(25)).unwrap(), Some(doc_id));
+        }
+
+        // the caller reads the document BEFORE deleting it, because on_delete
+        // needs the old field value to find the right index entry.
+        let before_delete = users.get(&mut pool, doc_id).unwrap().unwrap();
+        users.delete(&mut pool, doc_id).unwrap();
+
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
-        indexes.on_insert("users", &doc, doc_id).unwrap();
-        assert_eq!(indexes.search("users", "age", &Value::Int(25)).unwrap(), Some(doc_id));
-
-        let before_delete = users.get(doc_id).unwrap().unwrap();
-        users.delete(doc_id).unwrap();
         indexes.on_delete("users", &before_delete, doc_id).unwrap();
-
         assert_eq!(indexes.search("users", "age", &Value::Int(25)).unwrap(), None);
     }
 
     #[test]
     fn test_drop_index_removes_catalog_entry_and_frees_tree() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        catalog.create_collection("users").unwrap();
-
-        let mut pool = make_pool(tmp.path());
+        let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
+        catalog.create_collection(&mut pool, "users").unwrap();
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
         indexes.create("users", "age").unwrap();
         indexes.drop("users", "age").unwrap();

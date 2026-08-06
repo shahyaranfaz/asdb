@@ -8,6 +8,17 @@ The catalog fixes that by reserving page 0 for metadata:
   collection name -> heap root page id
 
 Important design choice:
+  The Catalog does NOT own a buffer pool. create_collection and open_collection
+  take the caller's shared `&mut BufferPool`, and Database owns the single pool
+  for the whole engine. It used to open a short-lived DiskManager and
+  BufferPool per call, which was both a corruption bug and the dominant cost in
+  every write path. See tests/multi_collection.rs.
+
+  The catalog still owns its path, because flush() rewrites page 0 directly,
+  deliberately outside the pool. Nothing else ever allocates page 0, so the two
+  writers cannot collide over it.
+
+Original note:
   Catalog owns the file path and opens short-lived DiskManager / BufferPool
   handles when it needs to create or open a collection. This keeps Phase 2
   simple while HeapFile still owns its BufferPool. Later, when we want multiple
@@ -25,7 +36,6 @@ use std::path::{Path, PathBuf};
 
 const CATALOG_PAGE_ID: PageId = 0;
 const CATALOG_MAGIC: &[u8; 8] = b"ASDBCAT1";
-const DEFAULT_BUFFER_POOL_CAPACITY: usize = 1024;
 
 /*
 CATALOG FORMAT
@@ -89,7 +99,6 @@ pub struct Catalog {
     path: PathBuf,
     collections: HashMap<String, PageId>,
     pub(crate) indexes: HashMap<(String, String), PageId>,
-    buffer_pool_capacity: usize,
 }
 
 impl Catalog {
@@ -128,7 +137,6 @@ impl Catalog {
             path: path.to_path_buf(),
             collections,
             indexes,
-            buffer_pool_capacity: DEFAULT_BUFFER_POOL_CAPACITY,
         })
     }
 
@@ -162,13 +170,15 @@ impl Catalog {
     This opens a fresh BufferPool over the same database file. Since page 0
     already exists, HeapFile::create will allocate page 1 or later for the root.
     */
-    pub fn create_collection(&mut self, name: &str) -> CatalogResult<Collection> {
+    pub fn create_collection(
+        &mut self,
+        bp: &mut BufferPool,
+        name: &str,
+    ) -> CatalogResult<Collection> {
         if self.collections.contains_key(name) {
             return Err(CatalogError::CollectionAlreadyExists(name.to_string()));
         }
 
-        let disk = DiskManager::open(&self.path)?;
-        let bp = BufferPool::new(disk, self.buffer_pool_capacity);
         let heap = HeapFile::create(bp)?;
         let collection = Collection::create(heap);
         self.collections.insert(name.to_string(), collection.root());
@@ -176,15 +186,17 @@ impl Catalog {
         Ok(collection)
     }
 
-    pub fn open_collection(&self, name: &str) -> CatalogResult<Collection> {
+    pub fn open_collection(
+        &self,
+        bp: &mut BufferPool,
+        name: &str,
+    ) -> CatalogResult<Collection> {
         let root = self
             .collections
             .get(name)
             .copied()
             .ok_or_else(|| CatalogError::CollectionNotFound(name.to_string()))?;
 
-        let disk = DiskManager::open(&self.path)?;
-        let bp = BufferPool::new(disk, self.buffer_pool_capacity);
         let heap = HeapFile::open(bp, root)?;
         Ok(Collection::open(heap))
     }
@@ -369,11 +381,29 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
+    /*
+    Catalog no longer owns a pool, so these build the pair the way Database
+    does: catalog FIRST (it allocates page 0 through its own short-lived
+    handle), THEN the pool, so the pool's DiskManager sees the real file
+    length. Reversing that order reintroduces the page-0 collision.
+    */
+    fn open_catalog(path: &std::path::Path) -> (Catalog, BufferPool) {
+        let catalog = Catalog::create(path).unwrap();
+        let disk = DiskManager::open(path).unwrap();
+        (catalog, BufferPool::new(disk, 64))
+    }
+
+    fn reopen_catalog(path: &std::path::Path) -> (Catalog, BufferPool) {
+        let catalog = Catalog::open(path).unwrap();
+        let disk = DiskManager::open(path).unwrap();
+        (catalog, BufferPool::new(disk, 64))
+    }
+
     #[test]
     fn test_create_catalog_reserves_page_zero() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        let users = catalog.create_collection("users").unwrap();
+        let (mut catalog, mut bp) = open_catalog(tmp.path());
+        let users = catalog.create_collection(&mut bp, "users").unwrap();
 
         assert_eq!(catalog.collection_root("users"), Some(users.root()));
         assert_ne!(users.root(), CATALOG_PAGE_ID);
@@ -386,18 +416,18 @@ mod tests {
         let saved_doc = user_doc(1, "alice");
 
         {
-            let mut catalog = Catalog::create(tmp.path()).unwrap();
-            let mut users = catalog.create_collection("users").unwrap();
-            saved_id = users.insert(&saved_doc).unwrap();
-            users.flush().unwrap();
+            let (mut catalog, mut bp) = open_catalog(tmp.path());
+            let mut users = catalog.create_collection(&mut bp, "users").unwrap();
+            saved_id = users.insert(&mut bp, &saved_doc).unwrap();
+            users.flush(&mut bp).unwrap();
             catalog.flush().unwrap();
         }
 
-        let catalog = Catalog::open(tmp.path()).unwrap();
+        let (catalog, mut bp) = reopen_catalog(tmp.path());
         assert_eq!(catalog.collection_names(), vec!["users".to_string()]);
 
-        let mut users = catalog.open_collection("users").unwrap();
-        assert_eq!(users.get(saved_id).unwrap(), Some(saved_doc));
+        let users = catalog.open_collection(&mut bp, "users").unwrap();
+        assert_eq!(users.get(&mut bp, saved_id).unwrap(), Some(saved_doc));
     }
 
     #[test]
@@ -406,31 +436,31 @@ mod tests {
         let count = 5_000;
 
         {
-            let mut catalog = Catalog::create(tmp.path()).unwrap();
-            let mut users = catalog.create_collection("users").unwrap();
+            let (mut catalog, mut bp) = open_catalog(tmp.path());
+            let mut users = catalog.create_collection(&mut bp, "users").unwrap();
             for i in 0..count {
-                users.insert(&user_doc(i, &format!("user-{i}"))).unwrap();
+                users.insert(&mut bp, &user_doc(i, &format!("user-{i}"))).unwrap();
             }
-            assert_eq!(users.scan().unwrap().len(), count as usize);
-            users.flush().unwrap();
+            assert_eq!(users.scan(&mut bp).unwrap().len(), count as usize);
+            users.flush(&mut bp).unwrap();
             catalog.flush().unwrap();
         }
 
-        let catalog = Catalog::open(tmp.path()).unwrap();
-        let mut users = catalog.open_collection("users").unwrap();
-        assert_eq!(users.scan().unwrap().len(), count as usize);
+        let (catalog, mut bp) = reopen_catalog(tmp.path());
+        let users = catalog.open_collection(&mut bp, "users").unwrap();
+        assert_eq!(users.scan(&mut bp).unwrap().len(), count as usize);
     }
 
     #[test]
     fn test_drop_collection_removes_catalog_entry() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        catalog.create_collection("users").unwrap();
+        let (mut catalog, mut bp) = open_catalog(tmp.path());
+        catalog.create_collection(&mut bp, "users").unwrap();
         catalog.drop_collection("users").unwrap();
 
         assert_eq!(catalog.collection_root("users"), None);
         assert!(matches!(
-            catalog.open_collection("users"),
+            catalog.open_collection(&mut bp, "users"),
             Err(CatalogError::CollectionNotFound(_))
         ));
     }
