@@ -305,6 +305,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 b'"' => self.read_string(line, col)?,
+                b'`' => self.read_quoted_ident(line, col)?,
                 b'0'..=b'9' => self.read_number(line, col)?,
                 b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident_or_keyword(),
                 _ => {
@@ -356,6 +357,45 @@ impl<'a> Lexer<'a> {
     rather than passed through, so typos surface early. the opening quote has
     already been peeked but not consumed when we get here.
     */
+    /*
+    read_quoted_ident: a backtick-quoted field name, `order`.
+
+    Produces a plain Token::Ident, so everything downstream treats it as an
+    ordinary identifier and no parser rule has to know about the quoting.
+
+    This exists because stage keywords are reserved: "order" always lexes as
+    Token::Order, so before this there was NO way to refer to a field actually
+    named order. Backticks are the escape hatch, the same one SQL spells with
+    double quotes and MySQL spells with backticks.
+
+    Deliberately simpler than read_string: no escape sequences. A field name
+    containing a literal backtick is not supported, and rejecting it outright
+    beats inventing an escape syntax nobody asked for. Empty names are
+    rejected too, since `` is a typo in every case.
+    */
+    fn read_quoted_ident(&mut self, open_line: usize, open_col: usize) -> Result<Token, LexError> {
+        self.bump(); // consume opening `
+        let mut out = String::new();
+        loop {
+            let Some(b) = self.peek() else {
+                return Err(LexError::UnterminatedString { line: open_line, col: open_col });
+            };
+            if b == b'`' {
+                self.bump();
+                if out.is_empty() {
+                    return Err(LexError::UnexpectedChar {
+                        ch: '`',
+                        line: open_line,
+                        col: open_col,
+                    });
+                }
+                return Ok(Token::Ident(out));
+            }
+            let ch = self.bump_char().expect("peek said there was a byte");
+            out.push(ch);
+        }
+    }
+
     fn read_string(&mut self, open_line: usize, open_col: usize) -> Result<Token, LexError> {
         self.bump(); // consume opening "
         let mut out = String::new();

@@ -1,19 +1,23 @@
 ================================================================
 ASL — Ave-Shay Language
-Query Language Specification v0.1
+Query Language Specification v0.2
 asdb
 ================================================================
 
 ----------------------------------------------------------------
 OVERVIEW
 ----------------------------------------------------------------
-ASL is a pipe-oriented query language for asdb. Queries are
-composed of discrete stages separated by the pipe operator (|).
-Each stage transforms a stream of documents and passes it to
-the next. Execution is left-to-right, lazy, iterator-based.
+ASL is a pipeline query language for asdb. Queries are composed
+of discrete stages. Each stage transforms a stream of documents
+and passes it to the next. Execution is left-to-right, lazy,
+iterator-based.
 
 A query is a pipeline:
-    <source> | <stage> | <stage> | ...
+    <source> <stage> <stage> ...
+
+Stages are self-delimiting: a new stage begins wherever a stage
+keyword appears in stage position. Separators between stages are
+optional decoration (see STAGE SEPARATION below).
 
 ----------------------------------------------------------------
 SYNTAX CONVENTIONS
@@ -27,9 +31,127 @@ SYNTAX CONVENTIONS
 - Comments: -- this is a comment
 
 ----------------------------------------------------------------
+STAGE SEPARATION
+----------------------------------------------------------------
+THE RULE:
+    A new stage begins wherever a stage keyword appears in stage
+    position. Any separator between stages is optional.
+
+Stage keywords are a closed set, which is what makes this
+unambiguous:
+
+    from    where   select  drop    order   limit
+    offset  group   join    insert  update  delete
+
+Because the keyword itself delimits the stage, all four of these
+parse to the identical pipeline:
+
+    from users | where age > 18 | select name      -- pipe
+    from users, where age > 18, select name        -- comma
+    from users where age > 18 select name          -- nothing
+
+    from users                                     -- newline
+    where age > 18
+    select name
+
+Pipe and comma are accepted and ignored between stages. Write
+whichever reads best. The pipe remains useful as a visual marker
+in long one-line queries; the newline form is preferred for
+multi-line queries.
+
+WHY NEWLINES NEED NO SPECIAL HANDLING:
+The lexer treats a newline as ordinary whitespace and never emits
+a token for it. It does not need to. In the multi-line example
+above, the `where` keyword on the second line is itself the
+delimiter, so the line break is incidental. This means multi-line
+queries work with no lexer changes and no significant-whitespace
+rules, and a stage may wrap across lines freely:
+
+    from users
+    where age > 18
+      and country == "CA"        -- continuation, not a new stage
+    select name
+
+`and` is not a stage keyword, so the where stage simply continues.
+
+DISAMBIGUATING THE LIST COMMA:
+Comma is already load-bearing inside stages: select lists, order
+keys, group keys, update assignments, array literals, document
+literals, and schema fields all use it. The rule above resolves
+this without a special case. At a comma, the token after it
+decides:
+
+    select name, email          email is not a keyword
+                                -> the select list continues
+
+    select name, where x > 1    where is a stage keyword
+                                -> the select stage ended
+
+THE OPTIONAL SEPARATOR IS OPTIONAL ONLY IN STAGE POSITION:
+This is the limit of the rule above and it is load-bearing. A
+separator may be omitted only where a stage keyword follows.
+Inside a list the comma is MANDATORY.
+
+    select name, email          two projections
+    select name email           NOT two projections, this is an
+                                error
+
+The reason is that juxtaposition already means something else in
+select position: it is how an aggregate takes its argument.
+
+    select sum total            one item, sum(total)
+    select sum, total           two items, the aggregate `sum`
+                                and the field `total`
+
+If bare juxtaposition also meant "next list item", those two
+would be indistinguishable. Keeping the omitted separator legal
+only in stage position is what buys that back, because a stage
+keyword can never be an aggregate argument.
+
+The same holds for order keys, group keys, update assignments,
+and array/document literals: all take mandatory commas. So the
+four "equivalent forms" claim above is precisely about the
+boundary BETWEEN stages, not about anything inside one.
+
+RESERVED WORDS (already paid for in v0.1):
+Stage keywords are reserved and cannot be used as bare field
+names. Without this, `select level, order` would be ambiguous:
+`order` could be a third projection or the start of an order
+stage.
+
+This looks like the cost of separator-optional syntax, and it is
+worth being precise that it is NOT. The v0.1 lexer already maps
+every one of these words to its own token unconditionally, so
+`select level, order` is already a parse error today. v0.2
+reserves nothing new. It spends a restriction the language had
+already taken on and was not using for anything.
+
+What v0.2 adds is the way OUT of that restriction, which v0.1
+does not have at all. A field whose name collides with a stage
+keyword can be backtick-quoted:
+
+    from logs select level, `order`
+
+Before this there was simply no way to name such a field. So on
+the reserved-word axis v0.2 is strictly a gain, not a trade.
+
+This is the same shape SQL uses: keywords delimit clauses,
+commas delimit lists, and quoting escapes a collision.
+
+RELATIONSHIP TO OTHER LANGUAGES:
+This is deliberately not MongoDB's model. Mongo queries are DATA
+(JSON documents describing a query), which serializes trivially
+but composes awkwardly and needs a separate API per operation
+shape (find vs aggregate vs updateOne). ASL queries are LANGUAGE
+(text parsed into one uniform pipeline). SQL is closer, in that
+its clauses are also self-delimiting keywords with no separators,
+but SQL writes SELECT first while executing FROM first. ASL keeps
+reading order and execution order identical.
+
+----------------------------------------------------------------
 DATA MODEL
 ----------------------------------------------------------------
-asdb stores collections of documents.
+shaydb stores collections of documents.
 A document is a set of key-value pairs.
 Values can be:
     - Int        64-bit signed integer
@@ -306,6 +428,24 @@ from sessions | where expires < 1700000000 | delete
 -- Schemaless insert (no schema required)
 from events | insert { type: "click", element: "btn-signup", ts: 1700000000 }
 
+-- The same query in all four separator styles (v0.2)
+from users | where age >= 18 | select name, email
+from users, where age >= 18, select name, email
+from users where age >= 18 select name, email
+
+from users
+where age >= 18
+select name, email
+
+-- Multi-line with a stage wrapping across lines
+from orders
+where status == "shipped"
+  and total > 100
+join users on user_id == id
+select name, total
+order total desc
+limit 25
+
 ----------------------------------------------------------------
 OUT OF SCOPE — v1
 ----------------------------------------------------------------
@@ -317,6 +457,21 @@ OUT OF SCOPE — v1
 - User permissions / auth
 - Replication
 
+----------------------------------------------------------------
+CHANGELOG
+----------------------------------------------------------------
+v0.2
+  - Stage separation reworked: stages are now self-delimiting by
+    keyword. Pipe, comma, newline, and nothing at all are all
+    accepted and equivalent between stages. See STAGE SEPARATION.
+  - Stage keywords are now reserved words. Backtick-quoting added
+    for field names that collide with them.
+  - Rationale for diverging from MongoDB's query-as-data model
+    recorded in STAGE SEPARATION.
+
+v0.1
+  - Initial specification. Pipe-only stage separation.
+
 ================================================================
-END OF SPEC v0.1
+END OF SPEC v0.2
 ================================================================

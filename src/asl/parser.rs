@@ -366,14 +366,112 @@ impl<'a> Parser<'a> {
 
     // ---------- pipeline ----------
 
+    /*
+    parse_pipeline: stages, separated by anything or nothing (asl.txt v0.2).
+
+    THE RULE: a new stage begins wherever a STAGE KEYWORD appears in stage
+    position. Whatever separator sits between stages is optional decoration.
+
+    So all four of these produce the identical Pipeline:
+
+        from users | where age > 18 | select name      pipe
+        from users, where age > 18, select name        comma
+        from users where age > 18 select name          nothing
+        from users \n where age > 18 \n select name     newline
+
+    The loop below is the whole implementation. It skips any separator it
+    finds, then continues as long as the next token opens a stage. Because the
+    KEYWORD is what delimits, a missing separator costs nothing, and a
+    newline needs no handling at all: the lexer already treats it as
+    whitespace, and the keyword on the next line is itself the delimiter.
+
+    BACKWARD COMPATIBLE. Every v0.1 query still parses unchanged, because a
+    pipe between stages is still accepted, just no longer required.
+    */
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
         let mut stages = Vec::new();
         stages.push(self.parse_from_stage()?);
-        while self.peek_token() == Some(&Token::Pipe) {
-            self.advance();
+        loop {
+            if matches!(self.peek_token(), Some(Token::Pipe) | Some(Token::Comma)) {
+                /*
+                A separator is only consumed when a stage actually follows it.
+                A TRAILING separator is left in place on purpose, so the
+                caller's end-of-input check rejects `from users |` instead of
+                silently accepting a truncated query. Optional decoration
+                between two stages is one thing; a separator with nothing
+                after it is a typo.
+                */
+                if !self.stage_keyword_at(1) {
+                    break;
+                }
+                self.advance();
+            } else if !self.stage_keyword_at(0) {
+                break;
+            }
             stages.push(self.parse_stage()?);
         }
         Ok(stages)
+    }
+
+    /*
+    at_stage_keyword: does the next token open a new stage?
+
+    The closed set from asl.txt. Keeping it in one place matters: this
+    predicate is what makes the separator optional, and it is also what stops
+    a select list at a stage boundary, so the two uses cannot drift apart.
+
+    From is included even though it may only appear first. Recognising it here
+    means `from a from b` fails with the parser's own "from may only appear as
+    the first stage" message rather than a confusing token error.
+    */
+    fn stage_keyword_at(&self, offset: usize) -> bool {
+        matches!(
+            self.peek_token_at(offset),
+            Some(Token::From)
+                | Some(Token::Where)
+                | Some(Token::Select)
+                | Some(Token::Drop)
+                | Some(Token::Order)
+                | Some(Token::Limit)
+                | Some(Token::Offset)
+                | Some(Token::Group)
+                | Some(Token::Join)
+                | Some(Token::Insert)
+                | Some(Token::Update)
+                | Some(Token::Delete)
+        )
+    }
+
+    /*
+    at_list_continuation: is this comma continuing a list, or ending a stage?
+
+    asl.txt: at a comma, the token AFTER it decides.
+
+        select name, email          email is not a keyword -> list continues
+        select name, where x > 1    where is a keyword     -> stage ended
+
+    Used by every comma-separated list inside a stage, so `select a, b` and
+    `select a, where ...` both do the right thing.
+    */
+    fn at_list_continuation(&self) -> bool {
+        if self.peek_token() != Some(&Token::Comma) {
+            return false;
+        }
+        !matches!(
+            self.peek_token_at(1),
+            Some(Token::From)
+                | Some(Token::Where)
+                | Some(Token::Select)
+                | Some(Token::Drop)
+                | Some(Token::Order)
+                | Some(Token::Limit)
+                | Some(Token::Offset)
+                | Some(Token::Group)
+                | Some(Token::Join)
+                | Some(Token::Insert)
+                | Some(Token::Update)
+                | Some(Token::Delete)
+        )
     }
 
     fn parse_from_stage(&mut self) -> Result<Stage, ParseError> {
@@ -423,7 +521,7 @@ impl<'a> Parser<'a> {
         }
         let mut items = Vec::new();
         items.push(self.parse_select_item()?);
-        while self.peek_token() == Some(&Token::Comma) {
+        while self.at_list_continuation() {
             self.advance();
             items.push(self.parse_select_item()?);
         }
@@ -489,7 +587,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Drop)?;
         let mut fields = Vec::new();
         fields.push(self.expect_ident()?);
-        while self.peek_token() == Some(&Token::Comma) {
+        while self.at_list_continuation() {
             self.advance();
             fields.push(self.expect_ident()?);
         }
@@ -500,7 +598,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Order)?;
         let mut keys = Vec::new();
         keys.push(self.parse_order_key()?);
-        while self.peek_token() == Some(&Token::Comma) {
+        while self.at_list_continuation() {
             self.advance();
             keys.push(self.parse_order_key()?);
         }
@@ -540,7 +638,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Group)?;
         let mut fields = Vec::new();
         fields.push(self.expect_ident()?);
-        while self.peek_token() == Some(&Token::Comma) {
+        while self.at_list_continuation() {
             self.advance();
             fields.push(self.expect_ident()?);
         }
@@ -589,7 +687,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Set)?;
         let mut assignments = Vec::new();
         assignments.push(self.parse_assignment()?);
-        while self.peek_token() == Some(&Token::Comma) {
+        while self.at_list_continuation() {
             self.advance();
             assignments.push(self.parse_assignment()?);
         }
