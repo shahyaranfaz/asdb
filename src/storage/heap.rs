@@ -34,7 +34,9 @@ a doc id (DocId) is the pair (page_id, slot_id). that's what callers hold
 onto to reference a specific record.
 */
 
-use super::{BufferPool, Page, PageId, PAGE_SIZE};
+use super::{BufferPool, Page, PageId, SharedBufferPool, PAGE_SIZE};
+
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub type SlotId = u16;
 pub type DocId = (PageId, SlotId);
@@ -68,8 +70,8 @@ pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - HEADER_SIZE - SLOT_SIZE;
 HeapFile: a chain of slotted pages anchored at `root`, with `last_page`
 cached for O(1) appends.
 
-owns its BufferPool for v1. when phase 2 introduces collections (multiple
-heaps sharing one pool), this will become a borrow / shared handle.
+holds a shared BufferPool handle. every heap opened by one Catalog therefore
+uses the same allocator and page cache.
 
 why cache last_page? without it, every insert walks the chain from root
 looking for a page with room, which is O(n) per insert and O(n^2) total
@@ -81,7 +83,7 @@ delete. that wastes space until compaction. compaction is out of scope
 for v1.
 */
 pub struct HeapFile {
-    bp: BufferPool,
+    bp: SharedBufferPool,
     root: PageId,
     last_page: PageId,
 }
@@ -94,8 +96,15 @@ impl HeapFile {
     `bp.new_page(...)` returns (PageId, R) where R is whatever the closure
     returns. we ignore the unit return with `_` and just keep the page id.
     */
-    pub fn create(mut bp: BufferPool) -> std::io::Result<Self> {
-        let (root, _) = bp.new_page(|page| init_heap_page(page))?;
+    pub fn create(bp: BufferPool) -> std::io::Result<Self> {
+        Self::create_shared(Arc::new(Mutex::new(bp)))
+    }
+
+    pub fn create_shared(bp: SharedBufferPool) -> std::io::Result<Self> {
+        let root = {
+            let mut pool = lock_pool(&bp)?;
+            pool.new_page(|page| init_heap_page(page))?.0
+        };
         Ok(HeapFile { bp, root, last_page: root })
     }
 
@@ -110,8 +119,24 @@ impl HeapFile {
     IO (chain walk), so it returns Result. callers that already had a
     HeapFile::open(bp, root) need to adapt.
     */
-    pub fn open(mut bp: BufferPool, root: PageId) -> std::io::Result<Self> {
-        let last_page = find_last_page(&mut bp, root)?;
+    pub fn open(bp: BufferPool, root: PageId) -> std::io::Result<Self> {
+        Self::open_shared(Arc::new(Mutex::new(bp)), root)
+    }
+
+    pub fn open_shared(bp: SharedBufferPool, root: PageId) -> std::io::Result<Self> {
+        let last_page = {
+            let mut pool = lock_pool(&bp)?;
+            find_last_page(&mut pool, root)?
+        };
+        Ok(HeapFile { bp, root, last_page })
+    }
+
+    pub(crate) fn open_shared_with_pool(
+        bp: SharedBufferPool,
+        pool: &mut BufferPool,
+        root: PageId,
+    ) -> std::io::Result<Self> {
+        let last_page = find_last_page(pool, root)?;
         Ok(HeapFile { bp, root, last_page })
     }
 
@@ -135,6 +160,18 @@ impl HeapFile {
     avoid an extra disk flush on a full tail is a good trade.
     */
     pub fn insert(&mut self, data: &[u8]) -> std::io::Result<DocId> {
+        let shared = Arc::clone(&self.bp);
+        let mut pool = lock_pool(&shared)?;
+        let result = self.insert_with_pool(data, &mut pool);
+        drop(pool);
+        result
+    }
+
+    pub(crate) fn insert_with_pool(
+        &mut self,
+        data: &[u8],
+        bp: &mut BufferPool,
+    ) -> std::io::Result<DocId> {
         assert!(!data.is_empty(), "empty records are not supported");
         assert!(
             data.len() <= MAX_RECORD_SIZE,
@@ -144,20 +181,38 @@ impl HeapFile {
 
         // fast path: tail page has room
         let tail = self.last_page;
-        let space = self.bp.with_page(tail, page_free_space)?;
+        let space = bp.with_page(tail, page_free_space)?;
         if space >= needed {
-            let slot = self.bp.with_page_mut(tail, |page| {
+            let slot = bp.with_page_mut(tail, |page| {
                 try_insert_in_page(page, data).expect("space check said it fits")
             })?;
             return Ok((tail, slot));
         }
 
-        // slow path: extend the chain with a new tail
-        let (new_id, slot) = self.bp.new_page(|page| {
+        /*
+        A second handle to this heap may have extended the chain since this
+        handle cached last_page. Re-walk from the cached page while holding
+        the shared pool lock. Usually this is one page; stale handles catch up
+        before linking a new page and cannot overwrite a newer tail link.
+        */
+        let current_tail = find_last_page(bp, tail)?;
+        self.last_page = current_tail;
+        if current_tail != tail {
+            let space = bp.with_page(current_tail, page_free_space)?;
+            if space >= needed {
+                let slot = bp.with_page_mut(current_tail, |page| {
+                    try_insert_in_page(page, data).expect("space check said it fits")
+                })?;
+                return Ok((current_tail, slot));
+            }
+        }
+
+        // slow path: extend the current tail
+        let (new_id, slot) = bp.new_page(|page| {
             init_heap_page(page);
             try_insert_in_page(page, data).expect("fresh page must fit")
         })?;
-        self.bp.with_page_mut(tail, |page| {
+        bp.with_page_mut(current_tail, |page| {
             write_u64(&mut page.data, HEADER_NEXT_OFFSET, new_id);
         })?;
         self.last_page = new_id;
@@ -172,8 +227,18 @@ impl HeapFile {
     (see with_page docs in buffer_pool.rs for why).
     */
     pub fn read(&mut self, doc_id: DocId) -> std::io::Result<Option<Vec<u8>>> {
+        let shared = Arc::clone(&self.bp);
+        let mut pool = lock_pool(&shared)?;
+        self.read_with_pool(doc_id, &mut pool)
+    }
+
+    pub(crate) fn read_with_pool(
+        &mut self,
+        doc_id: DocId,
+        bp: &mut BufferPool,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         let (pid, slot_id) = doc_id;
-        self.bp.with_page(pid, |page| read_slot(page, slot_id))
+        bp.with_page(pid, |page| read_slot(page, slot_id))
     }
 
     /*
@@ -183,8 +248,18 @@ impl HeapFile {
     if the slot is already a tombstone, this is a no-op.
     */
     pub fn delete(&mut self, doc_id: DocId) -> std::io::Result<()> {
+        let shared = Arc::clone(&self.bp);
+        let mut pool = lock_pool(&shared)?;
+        self.delete_with_pool(doc_id, &mut pool)
+    }
+
+    pub(crate) fn delete_with_pool(
+        &mut self,
+        doc_id: DocId,
+        bp: &mut BufferPool,
+    ) -> std::io::Result<()> {
         let (pid, slot_id) = doc_id;
-        self.bp.with_page_mut(pid, |page| {
+        bp.with_page_mut(pid, |page| {
             tombstone_slot(page, slot_id);
         })
     }
@@ -201,10 +276,19 @@ impl HeapFile {
     Some(PageId).
     */
     pub fn scan_all(&mut self) -> std::io::Result<Vec<(DocId, Vec<u8>)>> {
+        let shared = Arc::clone(&self.bp);
+        let mut pool = lock_pool(&shared)?;
+        self.scan_all_with_pool(&mut pool)
+    }
+
+    pub(crate) fn scan_all_with_pool(
+        &mut self,
+        bp: &mut BufferPool,
+    ) -> std::io::Result<Vec<(DocId, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut current: Option<PageId> = Some(self.root);
         while let Some(pid) = current {
-            let (records, next) = self.bp.with_page(pid, |page| {
+            let (records, next) = bp.with_page(pid, |page| {
                 let mut recs: Vec<(DocId, Vec<u8>)> = Vec::new();
                 let slot_count = read_u16(&page.data, HEADER_SLOT_COUNT_OFFSET);
                 for s in 0..slot_count {
@@ -226,8 +310,15 @@ impl HeapFile {
     explicit error handling (Drop in BufferPool swallows errors).
     */
     pub fn flush(&mut self) -> std::io::Result<()> {
-        self.bp.flush_all()
+        lock_pool(&self.bp)?.flush_all()
     }
+}
+
+fn lock_pool(bp: &SharedBufferPool) -> std::io::Result<MutexGuard<'_, BufferPool>> {
+    bp.lock().map_err(|_| std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "buffer pool lock poisoned",
+    ))
 }
 
 /*

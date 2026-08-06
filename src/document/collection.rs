@@ -16,7 +16,7 @@ Documents into heap records and back.
 
 use super::{deserialize_document, serialize_document, DecodeError, Document};
 
-use crate::storage::{DocId, HeapFile, PageId};
+use crate::storage::{BufferPool, DocId, HeapFile, PageId};
 
 use std::fmt;
 
@@ -62,9 +62,9 @@ pub type CollectionResult<T> = Result<T, CollectionError>;
 /*
 Collection: a named-ish document heap.
 
-For now it just owns one HeapFile. Later, catalog.rs will own the name/root
-mapping and hand back Collections by opening the right root page. The important
-thing is that callers above this layer deal in Documents, not raw Vec<u8>.
+It owns one HeapFile handle. Catalog owns the name/root mapping and opens every
+handle on its shared BufferPool. The important thing is that callers above
+this layer deal in Documents, not raw Vec<u8>.
 */
 pub struct Collection {
     heap: HeapFile,
@@ -126,16 +126,32 @@ impl Collection {
     */
     pub fn scan(&mut self) -> CollectionResult<Vec<(DocId, Document)>> {
         let records = self.heap.scan_all()?;
-        let mut docs = Vec::with_capacity(records.len());
-        for (doc_id, bytes) in records {
-            docs.push((doc_id, deserialize_document(&bytes)?));
-        }
-        Ok(docs)
+        decode_records(records)
+    }
+
+    pub(crate) fn scan_with_pool(
+        &mut self,
+        pool: &mut BufferPool,
+    ) -> CollectionResult<Vec<(DocId, Document)>> {
+        let records = self.heap.scan_all_with_pool(pool)?;
+        decode_records(records)
+    }
+
+    pub(crate) fn flush_with_pool(&mut self, pool: &mut BufferPool) -> CollectionResult<()> {
+        Ok(pool.flush_all()?)
     }
 
     pub fn flush(&mut self) -> CollectionResult<()> {
         Ok(self.heap.flush()?)
     }
+}
+
+fn decode_records(records: Vec<(DocId, Vec<u8>)>) -> CollectionResult<Vec<(DocId, Document)>> {
+        let mut docs = Vec::with_capacity(records.len());
+        for (doc_id, bytes) in records {
+            docs.push((doc_id, deserialize_document(&bytes)?));
+        }
+        Ok(docs)
 }
 
 #[cfg(test)]

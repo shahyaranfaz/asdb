@@ -9,40 +9,23 @@ use super::DatabaseResult;
 
 use crate::btree::IndexManager;
 use crate::document::{Catalog, Document, Value};
-use crate::storage::{BufferPool, DiskManager, DocId};
+use crate::storage::DocId;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct Database {
-    path: PathBuf,
     catalog: Catalog,
-    pool_capacity: usize,
 }
 
 impl Database {
     pub fn create(path: impl AsRef<Path>) -> DatabaseResult<Self> {
-        let path = path.as_ref().to_path_buf();
-        let catalog = Catalog::create(&path)?;
-        Ok(Database {
-            path,
-            catalog,
-            pool_capacity: 1024,
-        })
+        let catalog = Catalog::create(path.as_ref())?;
+        Ok(Database { catalog })
     }
 
     pub fn open(path: impl AsRef<Path>) -> DatabaseResult<Self> {
-        let path = path.as_ref().to_path_buf();
-        let catalog = Catalog::open(&path)?;
-        Ok(Database {
-            path,
-            catalog,
-            pool_capacity: 1024,
-        })
-    }
-
-    fn make_pool(&self) -> DatabaseResult<BufferPool> {
-        let disk = DiskManager::open(&self.path)?;
-        Ok(BufferPool::new(disk, self.pool_capacity))
+        let catalog = Catalog::open(path.as_ref())?;
+        Ok(Database { catalog })
     }
 
     pub fn has_collection(&self, name: &str) -> bool {
@@ -76,7 +59,8 @@ impl Database {
     }
 
     pub fn create_index(&mut self, collection: &str, field: &str) -> DatabaseResult<()> {
-        let mut pool = self.make_pool()?;
+        let shared = self.catalog.shared_pool();
+        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
         {
             let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
             indexes.create(collection, field)?;
@@ -86,7 +70,8 @@ impl Database {
     }
 
     pub fn drop_index(&mut self, collection: &str, field: &str) -> DatabaseResult<()> {
-        let mut pool = self.make_pool()?;
+        let shared = self.catalog.shared_pool();
+        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
         {
             let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
             indexes.drop(collection, field)?;
@@ -100,7 +85,8 @@ impl Database {
         let doc_id = collection_handle.insert(doc)?;
         collection_handle.flush()?;
 
-        let mut pool = self.make_pool()?;
+        let shared = self.catalog.shared_pool();
+        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
         {
             let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
             indexes.on_insert(collection, doc, doc_id)?;
@@ -120,7 +106,8 @@ impl Database {
         collection_handle.delete(doc_id)?;
         collection_handle.flush()?;
 
-        let mut pool = self.make_pool()?;
+        let shared = self.catalog.shared_pool();
+        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
         {
             let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
             indexes.on_delete(collection, &doc, doc_id)?;
@@ -142,7 +129,8 @@ impl Database {
         value: &Value,
     ) -> DatabaseResult<Option<(DocId, Document)>> {
         let doc_id = {
-            let mut pool = self.make_pool()?;
+            let shared = self.catalog.shared_pool();
+            let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
             let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
             indexes.search(collection, field, value)?
         };
@@ -166,7 +154,8 @@ impl Database {
         high: &Value,
     ) -> DatabaseResult<Vec<(DocId, Document)>> {
         let doc_ids = {
-            let mut pool = self.make_pool()?;
+            let shared = self.catalog.shared_pool();
+            let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
             let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
             indexes.range_scan(collection, field, low, high)?
         };
@@ -179,6 +168,10 @@ impl Database {
         }
         Ok(out)
     }
+}
+
+fn poisoned_pool() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, "buffer pool lock poisoned")
 }
 
 #[cfg(test)]

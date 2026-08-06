@@ -1,11 +1,8 @@
 /*
-multi_collection.rs: a latent storage-aliasing bug, pinned down before the
-executor can trip over it.
+multi_collection.rs: regression coverage for shared database storage ownership.
 
-STATUS: this test FAILS today. It is #[ignore]d so it does not break the
-suite, not because it is flaky. It is here as a specification of the problem,
-with the fix deliberately left out because the fix is a design change to
-Database and Catalog that should be reviewed on its own.
+STATUS: fixed. Catalog-created collections share one BufferPool, so page
+allocation and cached page state have one owner within a database.
 
 WHAT IS WRONG
 
@@ -30,30 +27,19 @@ Measured on this commit: collection a comes back with 206 documents, every
 one of them carrying b's tag. a's page chain had been rewritten to walk into
 b's pages.
 
-WHY Database DOES NOT HIT THIS TODAY
+WHY THIS NEEDS A REGRESSION TEST
 
-It is worth being precise, because the facade looks fine. Database::insert_doc
-and friends open a collection, do one operation, flush, and drop it before the
-next call. Nothing ever holds two handles at once, so the allocation windows
-never overlap and the same test written against Database passes.
+The Database facade happened to avoid the original failure by opening one
+short-lived collection at a time. The public Catalog API did not. Keeping this
+test at that lower boundary ensures future cache or allocator changes cannot
+reintroduce corruption that remains invisible until restart.
 
-The exposure is the LAYER BENEATH, which is public API. Any caller that holds
-two Collection handles simultaneously hits this, and the query executor is
-going to be exactly that caller: a hash join reads two collections at once by
-definition. So this wants fixing before 5.6, not after.
+THE FIX
 
-THE SHAPE OF A FIX
-
-One DiskManager and one BufferPool for the whole database, owned by Database,
-with HeapFile and Collection taking `bp: &mut BufferPool` per call instead of
-owning one. The alternatives are a shared Rc<RefCell<BufferPool>>, which moves
-borrow checking to runtime and turns a nested access into a panic, or holding
-a &'a mut borrow in the struct, which makes two live collections a compile
-error and so rules out the join that motivated this.
-
-Note also that Catalog::flush writes page 0 through its own DiskManager,
-outside any pool. That one is safe as long as nothing else ever allocates
-page 0, but it is the same pattern and worth keeping in view.
+Catalog owns an Arc<Mutex<BufferPool>> shared by every Collection and HeapFile
+handle it creates. Catalog page writes also go through that pool. Internal
+index-maintenance paths accept an already-held &mut BufferPool so they do not
+try to lock the same non-reentrant mutex twice.
 */
 
 use asdb::document::{Catalog, Document, Value};
@@ -71,7 +57,6 @@ fn padded(tag: i64) -> Document {
 }
 
 #[test]
-#[ignore = "known latent bug: Catalog hands every Collection its own BufferPool"]
 fn two_live_collection_handles_survive_a_restart() {
     let path = std::env::temp_dir().join("asdb_multi_collection_test.db");
     let _ = std::fs::remove_file(&path);
@@ -115,6 +100,39 @@ fn two_live_collection_handles_survive_a_restart() {
         wrong_a + wrong_b,
         0,
         "collections are reading each other's documents after restart"
+    );
+}
+
+#[test]
+fn two_handles_to_one_collection_preserve_the_heap_chain() {
+    let path = std::env::temp_dir().join("asdb_same_collection_handles_test.db");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let mut catalog = Catalog::create(&path).unwrap();
+        let mut first = catalog.create_collection("events").unwrap();
+        let mut second = catalog.open_collection("events").unwrap();
+
+        for _ in 0..200 {
+            first.insert(&padded(1)).unwrap();
+            second.insert(&padded(2)).unwrap();
+        }
+        first.flush().unwrap();
+    }
+
+    let catalog = Catalog::open(&path).unwrap();
+    let mut events = catalog.open_collection("events").unwrap();
+    let rows = events.scan().unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(rows.len(), 400, "a stale heap tail orphaned inserted rows");
+    assert_eq!(
+        rows.iter().filter(|(_, d)| d.get("tag") == Some(&Value::Int(1))).count(),
+        200,
+    );
+    assert_eq!(
+        rows.iter().filter(|(_, d)| d.get("tag") == Some(&Value::Int(2))).count(),
+        200,
     );
 }
 

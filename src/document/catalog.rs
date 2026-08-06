@@ -8,20 +8,21 @@ The catalog fixes that by reserving page 0 for metadata:
   collection name -> heap root page id
 
 Important design choice:
-  Catalog owns the file path and opens short-lived DiskManager / BufferPool
-  handles when it needs to create or open a collection. This keeps Phase 2
-  simple while HeapFile still owns its BufferPool. Later, when we want multiple
-  active collections and indexes sharing one cache, this should become a
-  Database object with one shared BufferPool.
+  One shared BufferPool coordinates page allocation and cached state for the
+  catalog and every collection opened from it. This prevents independent
+  allocators or caches from assigning and rewriting the same pages.
 */
 
 use super::{Collection, CollectionError};
 
-use crate::storage::{BufferPool, DiskManager, HeapFile, Page, PageId, PAGE_SIZE};
+use crate::storage::{
+    BufferPool, DiskManager, HeapFile, Page, PageId, SharedBufferPool, PAGE_SIZE,
+};
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const CATALOG_PAGE_ID: PageId = 0;
 const CATALOG_MAGIC: &[u8; 8] = b"ASDBCAT1";
@@ -86,10 +87,9 @@ impl From<CollectionError> for CatalogError {
 pub type CatalogResult<T> = Result<T, CatalogError>;
 
 pub struct Catalog {
-    path: PathBuf,
+    pool: SharedBufferPool,
     collections: HashMap<String, PageId>,
     pub(crate) indexes: HashMap<(String, String), PageId>,
-    buffer_pool_capacity: usize,
 }
 
 impl Catalog {
@@ -118,17 +118,29 @@ impl Catalog {
     rewrites page 0 immediately so a restart sees the latest catalog.
     */
     pub fn open(path: &Path) -> CatalogResult<Self> {
-        let mut disk = DiskManager::open(path)?;
+        let disk = DiskManager::open(path)?;
         if disk.num_pages() == 0 {
             return Err(CatalogError::InvalidCatalog);
         }
-        let page = disk.read_page(CATALOG_PAGE_ID)?;
+        let pool = Arc::new(Mutex::new(BufferPool::new(
+            disk,
+            DEFAULT_BUFFER_POOL_CAPACITY,
+        )));
+        let page = {
+            let mut guard = pool
+                .lock()
+                .map_err(|_| CatalogError::Io(poisoned_pool()))?;
+            guard.with_page(CATALOG_PAGE_ID, |page| {
+                let mut copy = Page::new();
+                copy.data.copy_from_slice(&page.data);
+                copy
+            })?
+        };
         let (collections, indexes) = decode_catalog_page(&page)?;
         Ok(Catalog {
-            path: path.to_path_buf(),
+            pool,
             collections,
             indexes,
-            buffer_pool_capacity: DEFAULT_BUFFER_POOL_CAPACITY,
         })
     }
 
@@ -156,20 +168,22 @@ impl Catalog {
         fields
     }
 
+    pub(crate) fn shared_pool(&self) -> SharedBufferPool {
+        Arc::clone(&self.pool)
+    }
+
     /*
     create_collection: allocate a new HeapFile root and persist its name.
 
-    This opens a fresh BufferPool over the same database file. Since page 0
-    already exists, HeapFile::create will allocate page 1 or later for the root.
+    The heap uses the Catalog's shared BufferPool. Since page 0 already exists,
+    HeapFile::create_shared will allocate page 1 or later for the root.
     */
     pub fn create_collection(&mut self, name: &str) -> CatalogResult<Collection> {
         if self.collections.contains_key(name) {
             return Err(CatalogError::CollectionAlreadyExists(name.to_string()));
         }
 
-        let disk = DiskManager::open(&self.path)?;
-        let bp = BufferPool::new(disk, self.buffer_pool_capacity);
-        let heap = HeapFile::create(bp)?;
+        let heap = HeapFile::create_shared(Arc::clone(&self.pool))?;
         let collection = Collection::create(heap);
         self.collections.insert(name.to_string(), collection.root());
         self.flush()?;
@@ -177,16 +191,29 @@ impl Catalog {
     }
 
     pub fn open_collection(&self, name: &str) -> CatalogResult<Collection> {
+        let pool = Arc::clone(&self.pool);
+        let root = self.collection_root_or_error(name)?;
+        let heap = HeapFile::open_shared(pool, root)?;
+        Ok(Collection::open(heap))
+    }
+
+    pub(crate) fn open_collection_with_pool(
+        &self,
+        name: &str,
+        pool: &mut BufferPool,
+    ) -> CatalogResult<Collection> {
+        let root = self.collection_root_or_error(name)?;
+        let heap = HeapFile::open_shared_with_pool(Arc::clone(&self.pool), pool, root)?;
+        Ok(Collection::open(heap))
+    }
+
+    fn collection_root_or_error(&self, name: &str) -> CatalogResult<PageId> {
         let root = self
             .collections
             .get(name)
             .copied()
             .ok_or_else(|| CatalogError::CollectionNotFound(name.to_string()))?;
-
-        let disk = DiskManager::open(&self.path)?;
-        let bp = BufferPool::new(disk, self.buffer_pool_capacity);
-        let heap = HeapFile::open(bp, root)?;
-        Ok(Collection::open(heap))
+        Ok(root)
     }
 
     /*
@@ -204,11 +231,21 @@ impl Catalog {
     }
 
     pub fn flush(&self) -> CatalogResult<()> {
-        let mut disk = DiskManager::open(&self.path)?;
+        let pool = Arc::clone(&self.pool);
+        let mut pool = pool.lock().map_err(|_| CatalogError::Io(poisoned_pool()))?;
+        self.flush_with_pool(&mut pool)
+    }
+
+    pub(crate) fn flush_with_pool(&self, pool: &mut BufferPool) -> CatalogResult<()> {
         let page = encode_catalog_page(&self.collections, &self.indexes)?;
-        disk.write_page(CATALOG_PAGE_ID, &page)?;
+        pool.with_page_mut(CATALOG_PAGE_ID, |target| *target = page)?;
+        pool.flush_all()?;
         Ok(())
     }
+}
+
+fn poisoned_pool() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, "buffer pool lock poisoned")
 }
 
 fn encode_catalog_page(collections: &HashMap<String, PageId>,

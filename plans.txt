@@ -3,7 +3,7 @@ asdb v1.0.0 — Implementation Plan / Current Status
 ================================================================
 
 Last verified: 2026-08-06. Phases 1-5 and the implemented portions of
-Phase 6 pass `cargo test` with 207 passed, 4 ignored, 0 failed.
+Phase 6 pass `cargo test` with 209 passed, 3 ignored, 0 failed.
 
 This file is both a plan and a reflection of current functionality. Completed
 phases describe what the code does now. Future phases describe the remaining
@@ -630,10 +630,11 @@ v1 product contract:
   multi-writer, or internet-facing database.
 
   7.1  One storage owner per database
-       Status: release blocker
+       Status: complete
        - Fix the ignored multi-collection corruption test in
          tests/multi_collection.rs
-       - Database owns one DiskManager and BufferPool for the whole file
+       - The Catalog/Database runtime owns one DiskManager and BufferPool for
+         the whole file
        - Collection, Catalog, HeapFile, and IndexManager borrow or share that
          coordinated storage owner instead of opening independent pools
        - Prevent overlapping allocators from assigning the same page
@@ -717,7 +718,7 @@ v1 product contract:
        - Reproducible release binaries and checksums
 
   v1.0 release gates:
-    [ ] Multi-collection persistence test passes without #[ignore]
+    [x] Multi-collection persistence test passes without #[ignore]
     [ ] Schema declarations are enforced or explicitly rejected
     [ ] Index validation and rebuild succeed after injected partial failures
     [ ] No user-controlled input reaches an unhandled panic

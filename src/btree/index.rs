@@ -28,18 +28,19 @@ impl<'a> IndexManager<'a> {
             btree.root()
         };
 
+        let mut existing = self.catalog.open_collection_with_pool(collection, self.pool)?;
+        let documents = existing.scan_with_pool(self.pool)?;
         let mut btree = BTree::open(root, self.pool);
-        let mut existing = self.catalog.open_collection(collection)?;
-        for (doc_id, doc) in existing.scan()? {
+        for (doc_id, doc) in documents {
             if let Some(value) = doc.get(field) {
                 let key = serialize_key(value);
                 btree.insert(&key, doc_id)?;
             }
         }
-        existing.flush()?;
+        existing.flush_with_pool(self.pool)?;
 
         self.catalog.indexes.insert(key, root);
-        self.catalog.flush()?;
+        self.catalog.flush_with_pool(self.pool)?;
         Ok(())
     }
 
@@ -52,7 +53,7 @@ impl<'a> IndexManager<'a> {
         let mut btree = BTree::open(root, self.pool);
         btree.free()?;
         self.catalog.indexes.remove(&key);
-        self.catalog.flush()?;
+        self.catalog.flush_with_pool(self.pool)?;
         Ok(())
     }
 
