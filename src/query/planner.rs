@@ -15,6 +15,7 @@ use super::{QueryError, QueryResult};
 use crate::asl::{BinOp, Expr, Pipeline, SelectItem, Stage};
 use crate::database::Database;
 use crate::query::evaluate::{doc_literal_to_document, literal_to_value};
+use crate::document::Value;
 use crate::query::plan::{PhysicalOp, ScanBounds};
 
 /*
@@ -178,12 +179,14 @@ can rebuild the Filter without them. Returning indices rather than expressions
 avoids comparing Exprs for equality, which would misbehave when a predicate
 repeats the same test twice.
 
-LIMITATION, v1: an IndexScan is only planned when BOTH ends of the range are
-known, which covers `field == v` and a low/high pair. A one-sided bound like
-`age >= 18` falls back to SeqScan, because the underlying range scan takes two
-concrete key values and there is no sentinel for "unbounded" in the key
-encoding yet. Correct, just slower than it could be.
-TODO(averi): add open-ended range support to the btree, then relax this.
+ONE-SIDED BOUNDS ARE CLOSED SYNTHETICALLY, see close_bounds. `age >= 18` gets
+a high end of i64::MAX rather than falling back to a full scan. This matters
+most for the TTL sweeper, whose query is exactly one-sided:
+
+    from telemtry_snapshots | where receivedAt < <cutoff> | delete
+
+Without it that is a full scan of the collection every sweep, forever. With
+it, it touches only the expired range.
 */
 fn plan_source(db: &Database, collection: &str, predicate: Option<&Expr>) -> (PhysicalOp, Vec<usize>) {
     let seq = PhysicalOp::SeqScan { collection: collection.to_string() };
@@ -201,10 +204,9 @@ fn plan_source(db: &Database, collection: &str, predicate: Option<&Expr>) -> (Ph
         let Some((bounds, exact)) = as_index_bound(conjunct, &field) else {
             continue;
         };
-        // see the LIMITATION note above
-        if bounds.low.is_none() || bounds.high.is_none() {
+        let Some(bounds) = close_bounds(bounds) else {
             continue;
-        }
+        };
 
         let scan = PhysicalOp::IndexScan {
             collection: collection.to_string(),
@@ -289,6 +291,54 @@ fn as_index_bound(expr: &Expr, field: &str) -> Option<(ScanBounds, bool)> {
         BinOp::Gt => Some((ScanBounds { low: Some(value), high: None }, false)),
         BinOp::LtEq => Some((ScanBounds { low: None, high: Some(value) }, true)),
         BinOp::Lt => Some((ScanBounds { low: None, high: Some(value) }, false)),
+        _ => None,
+    }
+}
+
+
+/*
+close_bounds: give a one-sided range a concrete other end.
+
+The btree's range_scan takes two concrete keys, so an open end needs a
+sentinel. The key encoding supplies one for free: keys are TYPE-TAGGED and
+order preserving (see document/key.rs), so the smallest and largest key of a
+given type bracket every value of that type and nothing else. An Int bound
+therefore closes with i64::MIN or i64::MAX, and a Float bound with the
+infinities.
+
+CAVEAT, and it is inherited rather than introduced: because the sentinel
+carries a type tag, the scan only covers values of THAT type. If an indexed
+field holds Ints in some documents and Floats in others, a range scan bounded
+by Ints will not see the Floats. That is already true of the two-sided path
+(`where age >= 5 and age <= 10` has the same blind spot), so this does not
+widen the exposure, but it is a real property of indexing a schemaless field
+and it is why mixed-type indexed columns should be avoided.
+
+Strings return None and keep the sequential-scan fallback. There is no
+greatest string, and inventing one (a long run of 0xFF) would be a guess that
+silently truncates real data above it.
+*/
+fn close_bounds(bounds: ScanBounds) -> Option<ScanBounds> {
+    match (&bounds.low, &bounds.high) {
+        (Some(_), Some(_)) => Some(bounds),
+        (Some(low), None) => type_max(low).map(|high| ScanBounds { low: bounds.low.clone(), high: Some(high) }),
+        (None, Some(high)) => type_min(high).map(|low| ScanBounds { low: Some(low), high: bounds.high.clone() }),
+        (None, None) => None,
+    }
+}
+
+fn type_min(like: &Value) -> Option<Value> {
+    match like {
+        Value::Int(_) => Some(Value::Int(i64::MIN)),
+        Value::Float(_) => Some(Value::Float(f64::NEG_INFINITY)),
+        _ => None,
+    }
+}
+
+fn type_max(like: &Value) -> Option<Value> {
+    match like {
+        Value::Int(_) => Some(Value::Int(i64::MAX)),
+        Value::Float(_) => Some(Value::Float(f64::INFINITY)),
         _ => None,
     }
 }

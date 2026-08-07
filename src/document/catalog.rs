@@ -8,25 +8,34 @@ The catalog fixes that by reserving page 0 for metadata:
   collection name -> heap root page id
 
 Important design choice:
-  One shared BufferPool coordinates page allocation and cached state for the
-  catalog and every collection opened from it. This prevents independent
-  allocators or caches from assigning and rewriting the same pages.
+  The Catalog does NOT own a buffer pool. create_collection and open_collection
+  take the caller's shared `&mut BufferPool`, and Database owns the single pool
+  for the whole engine. It used to open a short-lived DiskManager and
+  BufferPool per call, which was both a corruption bug and the dominant cost in
+  every write path. See tests/multi_collection.rs.
+
+  The catalog still owns its path, because flush() rewrites page 0 directly,
+  deliberately outside the pool. Nothing else ever allocates page 0, so the two
+  writers cannot collide over it.
+
+Original note:
+  Catalog owns the file path and opens short-lived DiskManager / BufferPool
+  handles when it needs to create or open a collection. This keeps Phase 2
+  simple while HeapFile still owns its BufferPool. Later, when we want multiple
+  active collections and indexes sharing one cache, this should become a
+  Database object with one shared BufferPool.
 */
 
 use super::{Collection, CollectionError};
 
-use crate::storage::{
-    BufferPool, DiskManager, HeapFile, Page, PageId, SharedBufferPool, PAGE_SIZE,
-};
+use crate::storage::{BufferPool, DiskManager, HeapFile, Page, PageId, PAGE_SIZE};
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 
 const CATALOG_PAGE_ID: PageId = 0;
 const CATALOG_MAGIC: &[u8; 8] = b"ASDBCAT1";
-const DEFAULT_BUFFER_POOL_CAPACITY: usize = 1024;
 
 /*
 CATALOG FORMAT
@@ -87,7 +96,7 @@ impl From<CollectionError> for CatalogError {
 pub type CatalogResult<T> = Result<T, CatalogError>;
 
 pub struct Catalog {
-    pool: SharedBufferPool,
+    path: PathBuf,
     collections: HashMap<String, PageId>,
     pub(crate) indexes: HashMap<(String, String), PageId>,
 }
@@ -118,27 +127,14 @@ impl Catalog {
     rewrites page 0 immediately so a restart sees the latest catalog.
     */
     pub fn open(path: &Path) -> CatalogResult<Self> {
-        let disk = DiskManager::open(path)?;
+        let mut disk = DiskManager::open(path)?;
         if disk.num_pages() == 0 {
             return Err(CatalogError::InvalidCatalog);
         }
-        let pool = Arc::new(Mutex::new(BufferPool::new(
-            disk,
-            DEFAULT_BUFFER_POOL_CAPACITY,
-        )));
-        let page = {
-            let mut guard = pool
-                .lock()
-                .map_err(|_| CatalogError::Io(poisoned_pool()))?;
-            guard.with_page(CATALOG_PAGE_ID, |page| {
-                let mut copy = Page::new();
-                copy.data.copy_from_slice(&page.data);
-                copy
-            })?
-        };
+        let page = disk.read_page(CATALOG_PAGE_ID)?;
         let (collections, indexes) = decode_catalog_page(&page)?;
         Ok(Catalog {
-            pool,
+            path: path.to_path_buf(),
             collections,
             indexes,
         })
@@ -168,52 +164,41 @@ impl Catalog {
         fields
     }
 
-    pub(crate) fn shared_pool(&self) -> SharedBufferPool {
-        Arc::clone(&self.pool)
-    }
-
     /*
     create_collection: allocate a new HeapFile root and persist its name.
 
-    The heap uses the Catalog's shared BufferPool. Since page 0 already exists,
-    HeapFile::create_shared will allocate page 1 or later for the root.
+    This opens a fresh BufferPool over the same database file. Since page 0
+    already exists, HeapFile::create will allocate page 1 or later for the root.
     */
-    pub fn create_collection(&mut self, name: &str) -> CatalogResult<Collection> {
+    pub fn create_collection(
+        &mut self,
+        bp: &mut BufferPool,
+        name: &str,
+    ) -> CatalogResult<Collection> {
         if self.collections.contains_key(name) {
             return Err(CatalogError::CollectionAlreadyExists(name.to_string()));
         }
 
-        let heap = HeapFile::create_shared(Arc::clone(&self.pool))?;
+        let heap = HeapFile::create(bp)?;
         let collection = Collection::create(heap);
         self.collections.insert(name.to_string(), collection.root());
         self.flush()?;
         Ok(collection)
     }
 
-    pub fn open_collection(&self, name: &str) -> CatalogResult<Collection> {
-        let pool = Arc::clone(&self.pool);
-        let root = self.collection_root_or_error(name)?;
-        let heap = HeapFile::open_shared(pool, root)?;
-        Ok(Collection::open(heap))
-    }
-
-    pub(crate) fn open_collection_with_pool(
+    pub fn open_collection(
         &self,
+        bp: &mut BufferPool,
         name: &str,
-        pool: &mut BufferPool,
     ) -> CatalogResult<Collection> {
-        let root = self.collection_root_or_error(name)?;
-        let heap = HeapFile::open_shared_with_pool(Arc::clone(&self.pool), pool, root)?;
-        Ok(Collection::open(heap))
-    }
-
-    fn collection_root_or_error(&self, name: &str) -> CatalogResult<PageId> {
         let root = self
             .collections
             .get(name)
             .copied()
             .ok_or_else(|| CatalogError::CollectionNotFound(name.to_string()))?;
-        Ok(root)
+
+        let heap = HeapFile::open(bp, root)?;
+        Ok(Collection::open(heap))
     }
 
     /*
@@ -231,21 +216,11 @@ impl Catalog {
     }
 
     pub fn flush(&self) -> CatalogResult<()> {
-        let pool = Arc::clone(&self.pool);
-        let mut pool = pool.lock().map_err(|_| CatalogError::Io(poisoned_pool()))?;
-        self.flush_with_pool(&mut pool)
-    }
-
-    pub(crate) fn flush_with_pool(&self, pool: &mut BufferPool) -> CatalogResult<()> {
+        let mut disk = DiskManager::open(&self.path)?;
         let page = encode_catalog_page(&self.collections, &self.indexes)?;
-        pool.with_page_mut(CATALOG_PAGE_ID, |target| *target = page)?;
-        pool.flush_all()?;
+        disk.write_page(CATALOG_PAGE_ID, &page)?;
         Ok(())
     }
-}
-
-fn poisoned_pool() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, "buffer pool lock poisoned")
 }
 
 fn encode_catalog_page(collections: &HashMap<String, PageId>,
@@ -406,11 +381,29 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
+    /*
+    Catalog no longer owns a pool, so these build the pair the way Database
+    does: catalog FIRST (it allocates page 0 through its own short-lived
+    handle), THEN the pool, so the pool's DiskManager sees the real file
+    length. Reversing that order reintroduces the page-0 collision.
+    */
+    fn open_catalog(path: &std::path::Path) -> (Catalog, BufferPool) {
+        let catalog = Catalog::create(path).unwrap();
+        let disk = DiskManager::open(path).unwrap();
+        (catalog, BufferPool::new(disk, 64))
+    }
+
+    fn reopen_catalog(path: &std::path::Path) -> (Catalog, BufferPool) {
+        let catalog = Catalog::open(path).unwrap();
+        let disk = DiskManager::open(path).unwrap();
+        (catalog, BufferPool::new(disk, 64))
+    }
+
     #[test]
     fn test_create_catalog_reserves_page_zero() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        let users = catalog.create_collection("users").unwrap();
+        let (mut catalog, mut bp) = open_catalog(tmp.path());
+        let users = catalog.create_collection(&mut bp, "users").unwrap();
 
         assert_eq!(catalog.collection_root("users"), Some(users.root()));
         assert_ne!(users.root(), CATALOG_PAGE_ID);
@@ -423,18 +416,18 @@ mod tests {
         let saved_doc = user_doc(1, "alice");
 
         {
-            let mut catalog = Catalog::create(tmp.path()).unwrap();
-            let mut users = catalog.create_collection("users").unwrap();
-            saved_id = users.insert(&saved_doc).unwrap();
-            users.flush().unwrap();
+            let (mut catalog, mut bp) = open_catalog(tmp.path());
+            let mut users = catalog.create_collection(&mut bp, "users").unwrap();
+            saved_id = users.insert(&mut bp, &saved_doc).unwrap();
+            users.flush(&mut bp).unwrap();
             catalog.flush().unwrap();
         }
 
-        let catalog = Catalog::open(tmp.path()).unwrap();
+        let (catalog, mut bp) = reopen_catalog(tmp.path());
         assert_eq!(catalog.collection_names(), vec!["users".to_string()]);
 
-        let mut users = catalog.open_collection("users").unwrap();
-        assert_eq!(users.get(saved_id).unwrap(), Some(saved_doc));
+        let users = catalog.open_collection(&mut bp, "users").unwrap();
+        assert_eq!(users.get(&mut bp, saved_id).unwrap(), Some(saved_doc));
     }
 
     #[test]
@@ -443,31 +436,31 @@ mod tests {
         let count = 5_000;
 
         {
-            let mut catalog = Catalog::create(tmp.path()).unwrap();
-            let mut users = catalog.create_collection("users").unwrap();
+            let (mut catalog, mut bp) = open_catalog(tmp.path());
+            let mut users = catalog.create_collection(&mut bp, "users").unwrap();
             for i in 0..count {
-                users.insert(&user_doc(i, &format!("user-{i}"))).unwrap();
+                users.insert(&mut bp, &user_doc(i, &format!("user-{i}"))).unwrap();
             }
-            assert_eq!(users.scan().unwrap().len(), count as usize);
-            users.flush().unwrap();
+            assert_eq!(users.scan(&mut bp).unwrap().len(), count as usize);
+            users.flush(&mut bp).unwrap();
             catalog.flush().unwrap();
         }
 
-        let catalog = Catalog::open(tmp.path()).unwrap();
-        let mut users = catalog.open_collection("users").unwrap();
-        assert_eq!(users.scan().unwrap().len(), count as usize);
+        let (catalog, mut bp) = reopen_catalog(tmp.path());
+        let users = catalog.open_collection(&mut bp, "users").unwrap();
+        assert_eq!(users.scan(&mut bp).unwrap().len(), count as usize);
     }
 
     #[test]
     fn test_drop_collection_removes_catalog_entry() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut catalog = Catalog::create(tmp.path()).unwrap();
-        catalog.create_collection("users").unwrap();
+        let (mut catalog, mut bp) = open_catalog(tmp.path());
+        catalog.create_collection(&mut bp, "users").unwrap();
         catalog.drop_collection("users").unwrap();
 
         assert_eq!(catalog.collection_root("users"), None);
         assert!(matches!(
-            catalog.open_collection("users"),
+            catalog.open_collection(&mut bp, "users"),
             Err(CatalogError::CollectionNotFound(_))
         ));
     }

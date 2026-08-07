@@ -9,23 +9,67 @@ use super::DatabaseResult;
 
 use crate::btree::IndexManager;
 use crate::document::{Catalog, Document, Value};
-use crate::storage::DocId;
+use crate::storage::{BufferPool, DiskManager, DocId, PageId};
 
 use std::path::Path;
 
+/// Frames the shared pool keeps resident. Was per-collection, so it used to be
+/// multiplied by however many collections happened to be open.
+const DEFAULT_POOL_CAPACITY: usize = 1024;
+
+/*
+ONE DiskManager, ONE BufferPool, ONE Catalog, for the whole database.
+
+This used to hold only a path and a capacity, and build a fresh BufferPool per
+operation via make_pool, while Catalog separately built one per Collection.
+That was wrong twice over:
+
+  CORRECTNESS. Two live Collection handles meant two DiskManagers over one
+  file, each caching its own num_pages, each allocating page ids from its own
+  stale count. They handed out the same page twice, and the per-pool caches
+  hid it until a restart. tests/multi_collection.rs is the regression test.
+
+  PERFORMANCE. Opening a pool per document was the dominant cost in insert,
+  delete, and index fetch. Measured before batching: ~3000 docs/s regardless
+  of batch size, a 0.86s TTL sweep over 2400 documents, and an index scan
+  940x SLOWER than the sequential scan it was meant to beat.
+
+Both symptoms, one cause. Sharing the pool fixes the class rather than the
+instances.
+*/
 pub struct Database {
     catalog: Catalog,
+    pool: BufferPool,
 }
 
 impl Database {
     pub fn create(path: impl AsRef<Path>) -> DatabaseResult<Self> {
-        let catalog = Catalog::create(path.as_ref())?;
-        Ok(Database { catalog })
+        let path = path.as_ref().to_path_buf();
+        let catalog = Catalog::create(&path)?;
+        // Catalog::create allocates page 0 through its own short-lived handle
+        // and must finish BEFORE the pool's DiskManager reads the file length,
+        // or the pool believes the file is empty and hands out page 0 twice.
+        let pool = BufferPool::new(DiskManager::open(&path)?, DEFAULT_POOL_CAPACITY);
+        Ok(Database { catalog, pool })
     }
 
     pub fn open(path: impl AsRef<Path>) -> DatabaseResult<Self> {
-        let catalog = Catalog::open(path.as_ref())?;
-        Ok(Database { catalog })
+        let path = path.as_ref().to_path_buf();
+        let catalog = Catalog::open(&path)?;
+        let pool = BufferPool::new(DiskManager::open(&path)?, DEFAULT_POOL_CAPACITY);
+        Ok(Database { catalog, pool })
+    }
+
+    /*
+    catalog_and_pool: both borrows at once.
+
+    db.catalog() and db.pool() in one expression does not compile, because each
+    would take &mut self. Returning the pair from one method does, because
+    inside it the compiler can see the two fields are disjoint. Standard escape
+    hatch, and the reason the helpers below live on Database.
+    */
+    fn catalog_and_pool(&mut self) -> (&mut Catalog, &mut BufferPool) {
+        (&mut self.catalog, &mut self.pool)
     }
 
     pub fn has_collection(&self, name: &str) -> bool {
@@ -37,8 +81,9 @@ impl Database {
     }
 
     pub fn create_collection(&mut self, name: &str) -> DatabaseResult<()> {
-        let mut collection = self.catalog.create_collection(name)?;
-        collection.flush()?;
+        let (catalog, pool) = self.catalog_and_pool();
+        let collection = catalog.create_collection(pool, name)?;
+        collection.flush(pool)?;
         self.catalog.flush()?;
         Ok(())
     }
@@ -54,72 +99,168 @@ impl Database {
     }
 
     pub fn scan_collection(&mut self, collection: &str) -> DatabaseResult<Vec<(DocId, Document)>> {
-        let mut collection = self.catalog.open_collection(collection)?;
-        Ok(collection.scan()?)
+        let (catalog, pool) = self.catalog_and_pool();
+        let handle = catalog.open_collection(pool, collection)?;
+        Ok(handle.scan(pool)?)
+    }
+
+    /*
+    scan_page: one page of a collection, plus the id of the next.
+
+    The streaming alternative to scan_collection. The executor's SeqScan uses
+    it so `limit 25` over a large collection stops after the first page instead
+    of materialising every document first.
+
+    Pass None as the cursor to start at the beginning. Returns None as the next
+    cursor when the chain is exhausted.
+    */
+    pub fn scan_page(
+        &mut self,
+        collection: &str,
+        cursor: Option<PageId>,
+    ) -> DatabaseResult<(Vec<(DocId, Document)>, Option<PageId>)> {
+        let (catalog, pool) = self.catalog_and_pool();
+        let handle = catalog.open_collection(pool, collection)?;
+        let page = cursor.unwrap_or_else(|| handle.first_page());
+        Ok(handle.scan_page(pool, page)?)
     }
 
     pub fn create_index(&mut self, collection: &str, field: &str) -> DatabaseResult<()> {
-        let shared = self.catalog.shared_pool();
-        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
+        let (catalog, pool) = self.catalog_and_pool();
         {
-            let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
+            let mut indexes = IndexManager::new(catalog, pool);
             indexes.create(collection, field)?;
         }
-        pool.flush_all()?;
+        self.pool.flush_all()?;
         Ok(())
     }
 
     pub fn drop_index(&mut self, collection: &str, field: &str) -> DatabaseResult<()> {
-        let shared = self.catalog.shared_pool();
-        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
+        let (catalog, pool) = self.catalog_and_pool();
         {
-            let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
+            let mut indexes = IndexManager::new(catalog, pool);
             indexes.drop(collection, field)?;
         }
-        pool.flush_all()?;
+        self.pool.flush_all()?;
         Ok(())
     }
 
+    /*
+    insert_doc: one document. Delegates to the batch path.
+
+    Before the pool was shared these were genuinely different code, because
+    the batch version existed to avoid re-opening the collection per document.
+    With one pool there is nothing left to avoid, so a single insert is just a
+    batch of one and the duplication goes away.
+    */
     pub fn insert_doc(&mut self, collection: &str, doc: &Document) -> DatabaseResult<DocId> {
-        let mut collection_handle = self.catalog.open_collection(collection)?;
-        let doc_id = collection_handle.insert(doc)?;
-        collection_handle.flush()?;
+        Ok(self.insert_docs(collection, std::slice::from_ref(doc))?[0])
+    }
 
-        let shared = self.catalog.shared_pool();
-        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
-        {
-            let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
-            indexes.on_insert(collection, doc, doc_id)?;
+    /*
+    insert_docs: insert a batch.
+
+    One collection handle and one index pass for the whole batch, then a single
+    flush. The flush is what makes batching worth anything now that the pool is
+    shared: fsync-per-document is the remaining fixed cost, and this pays it
+    once per statement instead of once per row.
+    */
+    pub fn insert_docs(
+        &mut self,
+        collection: &str,
+        docs: &[Document],
+    ) -> DatabaseResult<Vec<DocId>> {
+        if docs.is_empty() {
+            return Ok(Vec::new());
         }
-        pool.flush_all()?;
 
-        Ok(doc_id)
+        let (catalog, pool) = self.catalog_and_pool();
+        let mut handle = catalog.open_collection(pool, collection)?;
+        let mut doc_ids = Vec::with_capacity(docs.len());
+        for doc in docs {
+            doc_ids.push(handle.insert(pool, doc)?);
+        }
+
+        {
+            let mut indexes = IndexManager::new(catalog, pool);
+            for (doc, doc_id) in docs.iter().zip(doc_ids.iter()) {
+                indexes.on_insert(collection, doc, *doc_id)?;
+            }
+        }
+        self.pool.flush_all()?;
+        Ok(doc_ids)
     }
 
     pub fn delete_doc(&mut self, collection: &str, doc_id: DocId) -> DatabaseResult<bool> {
-        let mut collection_handle = self.catalog.open_collection(collection)?;
+        Ok(self.delete_docs(collection, &[doc_id])? == 1)
+    }
 
-        let Some(doc) = collection_handle.get(doc_id)? else {
-            return Ok(false);
-        };
+    /*
+    delete_docs: delete a batch.
 
-        collection_handle.delete(doc_id)?;
-        collection_handle.flush()?;
-
-        let shared = self.catalog.shared_pool();
-        let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
-        {
-            let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
-            indexes.on_delete(collection, &doc, doc_id)?;
+    Documents are READ BEFORE being deleted, because on_delete needs the old
+    field values to find the right index entries. An id that is already gone is
+    skipped rather than failing the batch, which matters because the TTL
+    sweeper can overlap its own previous pass.
+    */
+    pub fn delete_docs(&mut self, collection: &str, doc_ids: &[DocId]) -> DatabaseResult<usize> {
+        if doc_ids.is_empty() {
+            return Ok(0);
         }
-        pool.flush_all()?;
 
-        Ok(true)
+        let (catalog, pool) = self.catalog_and_pool();
+        let handle = catalog.open_collection(pool, collection)?;
+
+        let mut removed: Vec<(DocId, Document)> = Vec::with_capacity(doc_ids.len());
+        for doc_id in doc_ids {
+            let Some(doc) = handle.get(pool, *doc_id)? else {
+                continue; // already gone
+            };
+            handle.delete(pool, *doc_id)?;
+            removed.push((*doc_id, doc));
+        }
+
+        {
+            let mut indexes = IndexManager::new(catalog, pool);
+            for (doc_id, doc) in &removed {
+                indexes.on_delete(collection, doc, *doc_id)?;
+            }
+        }
+        self.pool.flush_all()?;
+        Ok(removed.len())
     }
 
     pub fn get_doc(&mut self, collection: &str, doc_id: DocId) -> DatabaseResult<Option<Document>> {
-        let mut collection = self.catalog.open_collection(collection)?;
-        Ok(collection.get(doc_id)?)
+        let (catalog, pool) = self.catalog_and_pool();
+        let handle = catalog.open_collection(pool, collection)?;
+        Ok(handle.get(pool, doc_id)?)
+    }
+
+    /*
+    fetch_docs: read many documents by id, one handle for the batch.
+
+    This used to loop over get_doc, which opened a fresh Collection, DiskManager
+    and BufferPool per call. On an index scan returning 22,000 rows that was
+    22,000 file opens, and it made the indexed path 940x SLOWER than a
+    sequential scan of the same data: 18.8s against 0.020s, measured.
+    */
+    fn fetch_docs(
+        &mut self,
+        collection: &str,
+        doc_ids: &[DocId],
+    ) -> DatabaseResult<Vec<(DocId, Document)>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (catalog, pool) = self.catalog_and_pool();
+        let handle = catalog.open_collection(pool, collection)?;
+        let mut out = Vec::with_capacity(doc_ids.len());
+        for doc_id in doc_ids {
+            if let Some(doc) = handle.get(pool, *doc_id)? {
+                out.push((*doc_id, doc));
+            }
+        }
+        Ok(out)
     }
 
     pub fn search_index(
@@ -129,21 +270,14 @@ impl Database {
         value: &Value,
     ) -> DatabaseResult<Option<(DocId, Document)>> {
         let doc_id = {
-            let shared = self.catalog.shared_pool();
-            let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
-            let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
+            let (catalog, pool) = self.catalog_and_pool();
+            let mut indexes = IndexManager::new(catalog, pool);
             indexes.search(collection, field, value)?
         };
-
         let Some(doc_id) = doc_id else {
             return Ok(None);
         };
-
-        let Some(doc) = self.get_doc(collection, doc_id)? else {
-            return Ok(None);
-        };
-
-        Ok(Some((doc_id, doc)))
+        Ok(self.get_doc(collection, doc_id)?.map(|doc| (doc_id, doc)))
     }
 
     pub fn range_index(
@@ -154,24 +288,20 @@ impl Database {
         high: &Value,
     ) -> DatabaseResult<Vec<(DocId, Document)>> {
         let doc_ids = {
-            let shared = self.catalog.shared_pool();
-            let mut pool = shared.lock().map_err(|_| poisoned_pool())?;
-            let mut indexes = IndexManager::new(&mut self.catalog, &mut pool);
+            let (catalog, pool) = self.catalog_and_pool();
+            let mut indexes = IndexManager::new(catalog, pool);
             indexes.range_scan(collection, field, low, high)?
         };
-
-        let mut out = Vec::new();
-        for doc_id in doc_ids {
-            if let Some(doc) = self.get_doc(collection, doc_id)? {
-                out.push((doc_id, doc));
-            }
-        }
-        Ok(out)
+        self.fetch_docs(collection, &doc_ids)
     }
-}
 
-fn poisoned_pool() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, "buffer pool lock poisoned")
+    /// Flush everything to disk. The catalog writes page 0 through its own
+    /// handle, deliberately outside the pool, since nothing else allocates it.
+    pub fn flush(&mut self) -> DatabaseResult<()> {
+        self.pool.flush_all()?;
+        self.catalog.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -339,5 +469,142 @@ mod tests {
 
         assert!(!db.has_collection("users"));
         assert!(!db.has_index("users", "age"));
+    }
+
+    /*
+    The batch paths changed how writes are issued (one open per statement
+    rather than one per document), so they need their own coverage: the
+    per-document methods passing proves nothing about them.
+    */
+    #[test]
+    fn test_insert_docs_matches_repeated_insert_doc() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("batched").unwrap();
+        db.create_collection("singly").unwrap();
+
+        let docs: Vec<Document> = (0..50)
+            .map(|i| {
+                let mut d = Document::new();
+                d.insert("n".to_string(), Value::Int(i));
+                d.insert("tag".to_string(), Value::String(format!("t{}", i % 5)));
+                d
+            })
+            .collect();
+
+        let ids = db.insert_docs("batched", &docs).unwrap();
+        assert_eq!(ids.len(), 50, "one id per document, in order");
+        for doc in &docs {
+            db.insert_doc("singly", doc).unwrap();
+        }
+
+        let mut batched: Vec<Document> =
+            db.scan_collection("batched").unwrap().into_iter().map(|(_, d)| d).collect();
+        let mut singly: Vec<Document> =
+            db.scan_collection("singly").unwrap().into_iter().map(|(_, d)| d).collect();
+        let key = |d: &Document| match d.get("n") {
+            Some(Value::Int(n)) => *n,
+            _ => -1,
+        };
+        batched.sort_by_key(key);
+        singly.sort_by_key(key);
+        assert_eq!(batched, singly, "batching must not change what is stored");
+
+        // the returned ids must actually address the documents they claim to
+        for (id, doc) in ids.iter().zip(docs.iter()) {
+            assert_eq!(db.get_doc("batched", *id).unwrap().as_ref(), Some(doc));
+        }
+    }
+
+    #[test]
+    fn test_insert_docs_maintains_indexes() {
+        // the index update moved out of the per-document loop, so prove the
+        // entries still land.
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("c").unwrap();
+        db.create_index("c", "n").unwrap();
+
+        let docs: Vec<Document> = (0..20)
+            .map(|i| {
+                let mut d = Document::new();
+                d.insert("n".to_string(), Value::Int(i));
+                d
+            })
+            .collect();
+        let ids = db.insert_docs("c", &docs).unwrap();
+
+        assert_eq!(db.search_index("c", "n", &Value::Int(7)).unwrap().map(|(id, _)| id), Some(ids[7]));
+        assert_eq!(db.range_index("c", "n", &Value::Int(5), &Value::Int(8)).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_delete_docs_removes_exactly_the_given_set() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("c").unwrap();
+
+        let docs: Vec<Document> = (0..30)
+            .map(|i| {
+                let mut d = Document::new();
+                d.insert("n".to_string(), Value::Int(i));
+                d
+            })
+            .collect();
+        let ids = db.insert_docs("c", &docs).unwrap();
+
+        let doomed: Vec<DocId> = ids.iter().step_by(3).copied().collect();
+        assert_eq!(db.delete_docs("c", &doomed).unwrap(), doomed.len());
+
+        let left = db.scan_collection("c").unwrap();
+        assert_eq!(left.len(), 30 - doomed.len());
+        assert!(
+            left.iter().all(|(_, d)| matches!(d.get("n"), Some(Value::Int(n)) if n % 3 != 0)),
+            "only every third document should be gone"
+        );
+    }
+
+    #[test]
+    fn test_delete_docs_skips_ids_that_are_already_gone() {
+        // the TTL sweeper can race its own previous pass; a stale id must not
+        // fail the whole batch.
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("c").unwrap();
+        let mut doc = Document::new();
+        doc.insert("n".to_string(), Value::Int(1));
+        let ids = db.insert_docs("c", &[doc]).unwrap();
+
+        assert_eq!(db.delete_docs("c", &ids).unwrap(), 1);
+        assert_eq!(db.delete_docs("c", &ids).unwrap(), 0, "second pass is a no-op, not an error");
+    }
+
+    #[test]
+    fn test_empty_batches_are_no_ops() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("c").unwrap();
+        assert!(db.insert_docs("c", &[]).unwrap().is_empty());
+        assert_eq!(db.delete_docs("c", &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_batch_survives_a_restart() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let mut db = Database::create(tmp.path()).unwrap();
+            db.create_collection("c").unwrap();
+            let docs: Vec<Document> = (0..100)
+                .map(|i| {
+                    let mut d = Document::new();
+                    d.insert("n".to_string(), Value::Int(i));
+                    d
+                })
+                .collect();
+            let ids = db.insert_docs("c", &docs).unwrap();
+            db.delete_docs("c", &ids[..40]).unwrap();
+        }
+        let mut db = Database::open(tmp.path()).unwrap();
+        assert_eq!(db.scan_collection("c").unwrap().len(), 60);
     }
 }

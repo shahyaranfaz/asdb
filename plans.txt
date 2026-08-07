@@ -3,7 +3,7 @@ asdb v1.0.0 — Implementation Plan / Current Status
 ================================================================
 
 Last verified: 2026-08-06. Phases 1-5 and the implemented portions of
-Phase 6 pass `cargo test` with 209 passed, 3 ignored, 0 failed.
+Phase 6 pass `cargo test` with 219 passed, 3 ignored, 0 failed.
 
 This file is both a plan and a reflection of current functionality. Completed
 phases describe what the code does now. Future phases describe the remaining
@@ -450,8 +450,8 @@ Current query module state:
        - Simple index rule:
            use IndexScan for a single-field indexed equality or a bounded
            `and` range on the same field
-           one-sided ranges currently fall back to SeqScan until the BTree
-           supports open-ended bounds
+           numeric one-sided ranges use encoded minimum/maximum sentinels;
+           unsupported key types such as strings fall back to SeqScan
            otherwise use SeqScan + Filter
        - No cost model in v1
        - Also plans order, group, aggregate, inner hash join, and update
@@ -461,7 +461,7 @@ Current query module state:
        - Execute physical plan against Database
        - For read pipelines, return Vec<Document> initially
        - Keep operator boundaries clean enough to move toward streaming later
-       - SeqScan reads Collection::scan()
+       - SeqScan reads one heap page at a time and stops early for limit
        - IndexScan gets DocIds from IndexManager then fetches docs by DocId
        - Filter applies expression evaluator
        - Projection builds output documents
@@ -770,7 +770,7 @@ Goal: control file growth and broaden efficient access paths.
        - Report reclaimable and reclaimed bytes
 
   9.2  Index improvements
-       - Open-ended range scans for one-sided predicates
+       - Generalize open-ended range scans beyond the numeric key types
        - Composite indexes with lexicographic key encoding
        - Unique, sparse, and partial indexes
        - Covering/index-only scans

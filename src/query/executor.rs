@@ -53,7 +53,7 @@ use crate::database::Database;
 use crate::document::{Document, Value};
 use crate::query::evaluate::{compare_values, evaluate, evaluate_bool, values_equal};
 use crate::query::plan::{PhysicalOp, ScanBounds};
-use crate::storage::DocId;
+use crate::storage::{DocId, PageId};
 
 use std::collections::HashMap;
 
@@ -203,7 +203,7 @@ fn build(plan: &PhysicalOp) -> QueryResult<Box<dyn Operator>> {
             assignments: assignments.clone(),
         }),
         PhysicalOp::Delete { input, collection } => {
-            Box::new(Delete { input: build(input)?, collection: collection.clone() })
+            Box::new(Delete { input: build(input)?, collection: collection.clone(), deleted: None })
         }
     })
 }
@@ -215,44 +215,68 @@ LEAVES
 */
 
 /*
-SeqScan: every live document in a collection.
+SeqScan: every live document in a collection, STREAMED a page at a time.
 
-MATERIALIZES ON FIRST next(). That is a known compromise, not the intended
-design. A true streaming scan needs a cursor into the heap that survives
-across next() calls, and holding one means holding a Collection handle open,
-which is the pattern tests/multi_collection.rs shows is currently unsafe:
-Catalog hands every Collection its own BufferPool. Going through
-Database::scan_collection instead keeps the handle's lifetime inside a single
-call, which is the only reason this is safe today.
+This used to materialise the whole collection on the first next(), so
+`limit 25` over a million documents still read a million documents. It could
+not do better, because a streaming cursor means holding a Collection handle
+across next() calls, and back then every Collection carried its own
+BufferPool, which made two live handles a corruption bug
+(tests/multi_collection.rs).
 
-The cost is real. `limit 25` over a million documents still reads a million
-documents here, because the buffering happens below the Limit. The Volcano
-interface above is unaffected, so fixing the storage layer later turns this
-into a genuine streaming scan without touching any other operator.
+Sharing the pool removed that constraint, so this now holds only a PAGE ID as
+its cursor and fetches the next page when the current one is drained. Limit
+stops asking, and the pages after it are never read.
+
+A page rather than a record at a time: the unit of IO is a page, so pulling
+one record per call would re-pin the same frame for every slot on it. One
+page of decoded documents is a small bounded buffer.
+
+The cursor is a page id rather than a live handle on purpose. Between calls
+this operator holds no borrow at all, which is what lets a HashJoin drive two
+scans without either of them pinning storage.
 */
 struct SeqScan {
     collection: String,
-    buffered: Option<std::vec::IntoIter<(DocId, Document)>>,
+    /// Page to fetch next. None once the chain is exhausted.
+    cursor: Option<PageId>,
+    /// Documents decoded from the current page, not yet emitted.
+    page: std::vec::IntoIter<(DocId, Document)>,
+    started: bool,
 }
 
 impl SeqScan {
     fn new(collection: String) -> Self {
-        SeqScan { collection, buffered: None }
+        SeqScan {
+            collection,
+            cursor: None,
+            page: Vec::new().into_iter(),
+            started: false,
+        }
     }
 }
 
 impl Operator for SeqScan {
     fn next(&mut self, ctx: &mut ExecContext) -> QueryResult<Option<Row>> {
-        if self.buffered.is_none() {
-            let docs = ctx.db.scan_collection(&self.collection)?;
-            self.buffered = Some(docs.into_iter());
+        loop {
+            if let Some((id, doc)) = self.page.next() {
+                return Ok(Some(Row::stored(id, doc)));
+            }
+            // current page drained; is there another?
+            if self.started && self.cursor.is_none() {
+                return Ok(None);
+            }
+            let (docs, next) = ctx.db.scan_page(&self.collection, self.cursor)?;
+            self.started = true;
+            self.cursor = next;
+            self.page = docs.into_iter();
+
+            // An empty page in the middle of a chain is legal (every slot on
+            // it tombstoned), so keep walking rather than stopping.
+            if self.page.len() == 0 && self.cursor.is_none() {
+                return Ok(None);
+            }
         }
-        Ok(self
-            .buffered
-            .as_mut()
-            .expect("just filled")
-            .next()
-            .map(|(id, doc)| Row::stored(id, doc)))
     }
 }
 
@@ -310,22 +334,43 @@ every index silently stale.
 */
 struct Insert {
     collection: String,
-    docs: std::vec::IntoIter<Document>,
+    docs: Vec<Document>,
+    written: Option<std::vec::IntoIter<Row>>,
 }
 
 impl Insert {
     fn new(collection: String, docs: Vec<Document>) -> Self {
-        Insert { collection, docs: docs.into_iter() }
+        Insert { collection, docs, written: None }
     }
 }
 
 impl Operator for Insert {
+    /*
+    Writes the WHOLE batch on the first call, then drains the results.
+
+    Inserting one document per next() looks more Volcano-ish and is much
+    slower: Database::insert_doc opens the collection and flushes the pool
+    twice per document, so a hundred-document batch paid that a hundred times.
+    insert_docs pays it once. Measured through the server, batches of 10, 50
+    and 200 all ran at the same per-document rate before this, which is the
+    signature of fixed per-document cost dominating.
+
+    Nothing is lost by buffering here. Insert is a leaf whose documents all
+    come from the query text, so they are already materialized, and execute()
+    drains the operator to completion regardless.
+    */
     fn next(&mut self, ctx: &mut ExecContext) -> QueryResult<Option<Row>> {
-        let Some(doc) = self.docs.next() else {
-            return Ok(None);
-        };
-        let doc_id = ctx.db.insert_doc(&self.collection, &doc)?;
-        Ok(Some(Row::stored(doc_id, doc)))
+        if self.written.is_none() {
+            let docs: Vec<Document> = self.docs.drain(..).collect();
+            let doc_ids = ctx.db.insert_docs(&self.collection, &docs)?;
+            let rows: Vec<Row> = doc_ids
+                .into_iter()
+                .zip(docs)
+                .map(|(id, doc)| Row::stored(id, doc))
+                .collect();
+            self.written = Some(rows.into_iter());
+        }
+        Ok(self.written.as_mut().expect("just filled").next())
     }
 }
 
@@ -877,21 +922,41 @@ leave index entries pointing at a dead DocId.
 struct Delete {
     input: Box<dyn Operator>,
     collection: String,
+    deleted: Option<std::vec::IntoIter<Row>>,
 }
 
 impl Operator for Delete {
+    /*
+    Drains the input, then deletes the whole matched set in ONE batch.
+
+    Same reasoning as Insert, and it matters more here because of the TTL
+    sweeper: it deletes every aged-out document in a single statement while
+    holding the server's global mutex, so the cost is time during which no
+    telemetry can be written. Deleting one at a time cost 0.86s for 2400
+    documents, which does not scale to a seven-day retention window.
+
+    Buffering is also what makes deleting safe while iterating. Removing rows
+    from a collection the input is still scanning is the classic way to skip
+    documents or read freed pages; collecting the ids first means the scan has
+    finished before anything is removed.
+    */
     fn next(&mut self, ctx: &mut ExecContext) -> QueryResult<Option<Row>> {
-        while let Some(row) = self.input.next(ctx)? {
-            let Some(doc_id) = row.doc_id else {
-                return Err(QueryError::InvalidPipeline(
-                    "delete needs stored rows; a projection before delete discards their identity"
-                        .to_string(),
-                ));
-            };
-            if ctx.db.delete_doc(&self.collection, doc_id)? {
-                return Ok(Some(row));
+        if self.deleted.is_none() {
+            let mut rows = Vec::new();
+            let mut doc_ids = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                let Some(doc_id) = row.doc_id else {
+                    return Err(QueryError::InvalidPipeline(
+                        "delete needs stored rows; a projection before delete discards their identity"
+                            .to_string(),
+                    ));
+                };
+                doc_ids.push(doc_id);
+                rows.push(row);
             }
+            ctx.db.delete_docs(&self.collection, &doc_ids)?;
+            self.deleted = Some(rows.into_iter());
         }
-        Ok(None)
+        Ok(self.deleted.as_mut().expect("just filled").next())
     }
 }
