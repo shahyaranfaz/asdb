@@ -15,6 +15,7 @@ everything. Exposing it takes an explicit --bind, so that is a decision
 someone makes rather than a default they inherit.
 */
 
+use asdb::binserver::BinServer;
 use asdb::database::Database;
 use asdb::server::Server;
 use asdb::ttl::{Policy, Sweeper};
@@ -23,6 +24,13 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 7070;
+/*
+The binary protocol listens on its own port alongside HTTP rather than
+replacing it. Same process, same Database, same file: only the framing
+differs. Keeping HTTP alive means curl still works for debugging and a client
+can move one call site at a time instead of all at once.
+*/
+const DEFAULT_ABP_PORT: u16 = 7071;
 const DEFAULT_BIND: &str = "127.0.0.1";
 
 /// How often the TTL sweeper runs. Mongo's own TTL monitor uses 60s.
@@ -65,6 +73,25 @@ fn main() {
         sweeper.spawn(server.database());
     }
 
+    // ABP first, on its own thread, sharing the Arc the HTTP server already
+    // holds. Failing to bind it is fatal rather than a warning: a client
+    // configured for the binary protocol falling back to nothing silently is
+    // worse than not starting.
+    if config.abp_port != 0 {
+        let abp_address = format!("{}:{}", config.bind, config.abp_port);
+        match TcpListener::bind(&abp_address) {
+            Ok(listener) => {
+                let db = server.database();
+                std::thread::spawn(move || BinServer::new(db).serve(listener));
+                println!("asdb listening on abp://{abp_address}  (binary protocol, ABP/1)");
+            }
+            Err(err) => {
+                eprintln!("error: could not bind {abp_address}: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let address = format!("{}:{}", config.bind, config.port);
     let listener = match TcpListener::bind(&address) {
         Ok(listener) => listener,
@@ -88,7 +115,8 @@ const USAGE: &str = "\
 usage: asdb <database-file> [options]
 
 options:
-  --port N                 port to listen on (default 7070)
+  --port N                 HTTP port to listen on (default 7070)
+  --abp-port N             binary protocol port (default 7071, 0 disables)
   --bind ADDR              address to bind (default 127.0.0.1)
   --ttl COLL.FIELD=SPEC    expire documents older than SPEC.
                            SPEC is Ns, Nm, Nh or Nd, matching Spring Data's
@@ -101,6 +129,7 @@ example:
 struct Config {
     path: String,
     port: u16,
+    abp_port: u16,
     bind: String,
     policies: Vec<Policy>,
 }
@@ -116,6 +145,7 @@ impl Config {
     fn parse(args: &[String]) -> Result<Config, String> {
         let mut path = None;
         let mut port = DEFAULT_PORT;
+        let mut abp_port = DEFAULT_ABP_PORT;
         let mut bind = DEFAULT_BIND.to_string();
         let mut policies = Vec::new();
 
@@ -125,6 +155,11 @@ impl Config {
                 "--port" => {
                     let raw = args.get(i + 1).ok_or("--port needs a value")?;
                     port = raw.parse().map_err(|_| format!("bad port: {raw}"))?;
+                    i += 2;
+                }
+                "--abp-port" => {
+                    let raw = args.get(i + 1).ok_or("--abp-port needs a value")?;
+                    abp_port = raw.parse().map_err(|_| format!("bad abp port: {raw}"))?;
                     i += 2;
                 }
                 "--bind" => {
@@ -156,6 +191,7 @@ impl Config {
         Ok(Config {
             path: path.ok_or("no database file given")?,
             port,
+            abp_port,
             bind,
             policies,
         })

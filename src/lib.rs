@@ -7,3 +7,5 @@ pub mod server;
 pub mod ttl;
 pub mod query;
 pub mod storage;
+pub mod binserver;
+pub mod wire;

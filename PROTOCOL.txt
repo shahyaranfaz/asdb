@@ -1,0 +1,413 @@
+================================================================================
+ABP/1  ::  the asdb binary protocol
+A record of what was measured and what each measurement forced.
+================================================================================
+
+This document sits beside the protocol, not above it. It is not a project
+history and not a tutorial. Every section is a decision followed by the number
+that made it, so that anyone changing the protocol later can see which numbers
+their change invalidates.
+
+WHERE IT LIVES
+
+    src/wire.rs       encoding and decoding. Pure functions, no IO.
+    src/binserver.rs  the listener. One thread per connection.
+    src/bin/abpbench  the benchmark every number below comes from.
+
+ABP IS NOT A SECOND DATABASE. asdb runs one process holding one Database, and
+both listeners share it through the same Arc<Mutex<Database>>:
+
+                       one asdb process
+      :7070 HTTP  --> server.rs     --+
+                                      +--> Arc<Mutex<Database>> --> storage, btree
+      :7071 ABP   --> binserver.rs  --+
+
+Same file on disk, same B-trees, same query engine. Only the part that reads
+bytes off a socket differs. HTTP stays enabled so curl still works and so a
+client can move one call site at a time.
+
+Measurements were taken on macOS (Darwin 25.3.0), release build, loopback TCP,
+2000 operations per row. Absolute numbers are machine specific. The ratios and
+the ordering are the parts that carry.
+
+
+================================================================================
+0.  THE MEASUREMENT THAT STARTED IT
+================================================================================
+
+Before writing anything, the question was where a request actually goes. Two
+programs answered it.
+
+src/bin/phases.rs, in process, no network at all, one document inserted:
+
+        lex             1.02 us     8.8%
+        parse           0.92 us     7.9%
+        bind + plan     1.16 us     9.9%
+        execute         8.53 us    73.4%
+        ---------------------------------
+        total          11.62 us
+
+src/bin/httpcost.rs, the same insert over asdb's HTTP server:
+
+        HTTP round trip                63.32 us
+          of which TCP connect+close   31.20 us    49%
+          in-process work              11.62 us    18%
+          protocol and network         51.70 us    82%
+
+82% of a request was protocol, and HALF of the entire request was opening and
+closing a TCP connection that the previous request had just discarded.
+
+That ordering set the work, largest cost first:
+
+        1. persistent connections     ~31 us    49% of a request
+        2. binary framing             ~20 us    32%
+        3. skip re-parsing            ~3.1 us   27% of the in-process WORK
+
+Note the shape of item 3. Lex, parse, bind and plan are 27% of the in-process
+work but only 5% of a request over HTTP. Optimising the parser first would have
+been optimising the smallest number in the table, which is exactly the mistake
+the measurement existed to prevent.
+
+
+================================================================================
+1.  THE WIRE FORMAT
+================================================================================
+
+Every message, both directions:
+
+        [u32 length LE][u8 opcode][payload]
+         \___________/
+          counts opcode + payload, NOT the 4 length bytes
+
+Length prefixed rather than delimited, because document values are arbitrary
+bytes and any delimiter would need escaping. A length cannot be spoofed by
+content. This removes an injection class by construction instead of by careful
+escaping, which is section 5.
+
+Little endian throughout, matching storage/heap.rs. Every platform this runs on
+is little endian, so the conversion is a no-op.
+
+OPCODES
+
+    requests                            responses
+    0x01  EXEC     ASL text             0x81  AFFECTED   u64
+    0x02  INSERT   binary documents     0x82  DOCUMENTS  u32 count + documents
+    0x03  PING                          0x83  ERROR      u32 len + UTF-8
+    0x04  CLOSE                         0x84  PONG
+
+The high bit marks a response, so a frame's direction is readable from one byte
+while debugging a hex dump.
+
+    EXEC    [u32 len][ASL text]
+    INSERT  [u32 len][collection][u32 count][document bodies]
+
+VALUES: one tag byte, then the payload.
+
+    0x00  Null          no payload
+    0x01  Bool false    no payload
+    0x02  Bool true     no payload
+    0x03  Int           i64 LE
+    0x04  Float         f64 LE
+    0x05  String        u32 len + UTF-8
+    0x06  Array         u32 count + values
+    0x07  Document      u32 count + (u32 keylen + key + value) pairs
+
+Tags mirror document/key.rs's existing convention so the two stay aligned.
+Bool is two tags rather than a tag plus a byte: one byte smaller, and it
+removes the question of what a non-zero non-one bool byte means.
+
+Document fields are written in SORTED key order. Document is a HashMap, whose
+iteration order varies between runs, and a format that reorders its own fields
+cannot be diffed, golden-tested or checksummed. json.rs sorts for the same
+reason.
+
+
+================================================================================
+2.  WHAT EACH CHANGE BOUGHT
+================================================================================
+
+Each row adds exactly one change to the row above it, against one Database, so
+the differences are attributable rather than merely suggestive.
+
+    per insert, 2000 operations per row
+
+    0. in-process, no socket          6.95 us    the work itself
+    1. HTTP, connect per request     68.82 us    baseline
+         of which TCP connect+close  29.88 us    43% of it
+    2. ABP exec, ASL text            22.78 us     3.02x
+    3. ABP insert, binary documents  20.13 us     3.42x
+    4. ABP insert, pipelined x32      7.07 us     9.74x
+    5. ABP insert, batch of 100       1.55 us    44.50x
+    6. ABP ping, protocol floor      12.62 us
+
+    attribution
+      persistent connection+framing  46.04 us saved
+      skipping lex/parse/bind/plan    2.65 us saved
+      pipelining alone               13.06 us saved
+      batching the round trip        18.59 us saved
+
+    protocol cost, single insert (row minus row 0)
+      over HTTP                      61.88 us    90% of the request
+      over ABP                       13.19 us    65% of the request
+      over ABP, pipelined             0.12 us     2% of the request
+
+    batch of 100, per document
+      in-process                      0.96 us
+      over ABP                        1.55 us    protocol adds 0.58 us (38%)
+
+THE RESULT: on the pipelined path the protocol costs 0.12 us out of 7.07, which
+is 2% of the request. Over HTTP it was 61.88 out of 68.82, which was 90%. What
+remains is the storage engine's own work, so further gains belong to storage
+and not here. That is the point at which protocol work should stop.
+
+
+================================================================================
+3.  THE DECISIONS, AND THE NUMBER BEHIND EACH
+================================================================================
+
+PERSISTENT CONNECTIONS.  Worth ~30 us, 43% of an HTTP request, and it needed a
+loop instead of a return. This is the whole reason the rest exists: no amount
+of encoding cleverness recovers a cost paid before the first byte is parsed.
+
+TCP_NODELAY.  Not visible in any row above, which is exactly why it is written
+down. Nagle's algorithm holds a small write for up to 40ms waiting to coalesce
+with data that, in a request/response protocol, is never coming. On a 7 us
+operation that is a 5700x latency penalty, appearing intermittently and looking
+like "the database is randomly slow". One line, set on every connection.
+
+OP_INSERT, DOCUMENTS RATHER THAN TEXT.  Worth 2.65 us, 13% of an ABP request.
+The smallest of the three wins and the one most likely to have been done first
+on intuition. It survives because the dominant operation in this workload is
+"insert these documents", and expressing that as text means the client renders
+values to text and the server immediately lexes and parses them back into the
+values it started with. OP_EXEC still accepts arbitrary ASL, so nothing is lost
+and the general path stays one implementation.
+
+PIPELINING, WHICH COST NOTHING TO SUPPORT.  Row 3 to row 4 is 20.13 to 7.07 us,
+a 13.06 us saving from sending 32 requests before reading any reply. The floor
+was round-trip latency, not syscall throughput, and knowing which one it was
+required measuring both.
+
+The saving needed no protocol change at all. Frames are length prefixed and
+replies are written in arrival order, so a client simply stops waiting. No
+request ids, no correlation field, no out-of-order replies to reassemble. That
+property fell out of the framing choice, so the test named
+test_pipelined_requests_reply_in_order exists to turn it from something that
+happens to be true into something the protocol promises.
+
+BATCHING STILL BEATS PIPELINING, 1.55 us against 7.07 us, because insert_docs
+takes one collection handle and does one flush for the whole batch while 32
+pipelined single inserts do 32 flushes. The remaining cost there is storage, not
+protocol: in-process batching is 0.96 us against ABP's 1.55 us.
+
+ERRORS ARE A FRAME, NOT A HANGUP.  A connection that died on a bad statement
+would force a reconnect and hand back the ~30 us this protocol exists to remove.
+Recovery is tested, not assumed: test_error_does_not_kill_the_connection sends
+garbage, checks the error frame, then inserts successfully on the same socket.
+
+ONE MUTEX, UNCHANGED.  Statements still serialise. That is the storage layer's
+constraint and the protocol does not pretend otherwise. Concurrency is tested
+for correctness rather than speed: 8 connections, 25 inserts each, 200 documents
+present at the end.
+
+
+================================================================================
+4.  MEASURED AND REJECTED
+================================================================================
+
+Recorded because "why is this not a varint" is otherwise asked once a year.
+
+VARINT INTEGERS.  Rejected. Small integers would shrink, but the most common
+integer in this workload is an epoch-millis timestamp near 1.75e12, which needs
+7 varint bytes against 8 fixed, saving one byte while adding a branchy decode
+loop to every field. At row 4's 0.12 us of protocol cost there is nothing left
+to win.
+
+COMPRESSION.  Rejected at this layer. Telemetry documents are ~150 bytes and
+the transport is loopback or a LAN. Compression trades CPU for bytes on a path
+that is not short of bytes, and row 4 says the protocol is already 2% of the
+request.
+
+A PREPARED STATEMENT CACHE.  Deferred, and the measurement is why. Lex, parse,
+bind and plan together are 3.1 us. OP_INSERT already removes them for the
+dominant operation, and for everything else 3.1 us sits against a 6.95 us
+storage cost. It would be real work for a case OP_INSERT already covers.
+
+STRUCTURED ERRORS with codes rather than strings. Deferred, no measurement
+needed: nothing consumes them programmatically yet. When something does, the
+opcode is there and the payload is versioned by it.
+
+FSYNC. Still absent, unchanged by this work, and stated here so the protocol is
+not read as a durability claim. A SIGKILL crash test survived every acked write
+across 4 trials, but there is no fsync anywhere, so power loss remains unsafe.
+ABP makes writes faster to submit, not safer once submitted.
+
+
+================================================================================
+5.  VALUES CANNOT BECOME SYNTAX
+================================================================================
+
+On the text path, a telemetry value arriving from a Roblox game server as
+
+        x" } | delete //
+
+would close the string, close the document and append a delete stage unless it
+is escaped. That is what AsdbEntityMapper.quote on the Java side exists to do,
+and it is the same class of bug as SQL injection: correctness depending on an
+escaping routine being right every single time.
+
+On OP_INSERT the value arrives as a length-prefixed byte run and is never
+lexed. There is no escaping to get wrong because there is no parser to confuse.
+The defence is structural rather than procedural.
+
+test_values_cannot_become_syntax stores exactly that payload, plus a field named
+"order" which is a reserved word the text path has to backtick, then queries the
+collection back: one document, bytes identical, collection intact. Tested rather
+than asserted, because a security property nobody executes is a comment.
+
+
+================================================================================
+6.  THE CLIENT, MEASURED FROM JAVA
+================================================================================
+
+A protocol nothing speaks is a benchmark, not a feature. SHAYVERI's client
+lives in its ingress/asdb package: AbpCodec.java mirrors wire.rs, and
+AsdbBinaryClient.java holds a pool of persistent connections.
+
+Same server, same database, same documents, driven from Java, 2000 operations
+per row:
+
+    HTTP + ASL text            236.78 us    baseline
+    ABP binary, single          28.57 us    8.29x
+    ABP binary, batch of 100     3.27 us   72.45x
+
+The ratios are LARGER than section 2's because the baseline is worse: section 2
+drove HTTP from a hand-written socket, while this drives it through
+java.net.http.HttpClient, which adds its own per-request machinery on top of
+the connect and teardown. That is the honest comparison, because HttpClient is
+what the application actually used.
+
+saveEvents sends batches, so it lands on the 72x row.
+
+TWO THINGS THE JAVA SIDE NEEDED THAT THE RUST SIDE DID NOT
+
+A CONNECTION POOL, not one shared socket. asdb replies in arrival order per
+connection, which is what makes pipelining free, and is also what makes a
+shared socket unusable: two threads writing to one would interleave frames and
+read each other's replies. Each caller borrows a connection for one request.
+
+ReentrantLock, NOT synchronized. This application runs on virtual threads. In
+Java 21 a virtual thread blocking inside synchronized PINS its carrier platform
+thread, so a slow write would hold a real OS thread hostage and throttle the
+whole executor. ReentrantLock parks the virtual thread and frees the carrier.
+Nothing measures this until it is under load, at which point it is very hard to
+attribute.
+
+TWO BUGS THE TESTS FOUND, both worth recording because neither was visible by
+reading the code:
+
+An INTEGER OVERFLOW in the Java bounds check. It was written pos + n >
+buf.length, and a length field of Integer.MAX_VALUE makes that sum wrap
+negative, so the check passed and the read failed with a raw
+StringIndexOutOfBoundsException instead of a diagnosable error. That is exactly
+the hostile input the check existed to stop. Written as a subtraction now.
+
+A SEAM THAT LIED. The store's Transport interface takes a collection name, and
+the binary implementation put it on the wire while the text implementation
+ignored it and derived the name from the entity's @Document. Harmless in
+production, because the store passes the annotation-derived name anyway, and a
+trap for the next caller. The parity test found it, which is the argument for
+having one rather than testing each transport alone.
+
+
+================================================================================
+7.  TESTS
+================================================================================
+
+    asdb (Rust)
+      src/wire.rs        9 tests   encoding
+      src/binserver.rs  11 tests   the server over a real socket
+      full suite: 199 lib tests, 0 failed
+
+    SHAYVERI (Java)
+      AbpCodecTest              13 tests   encoding, no server needed
+      AsdbTransportParityTest    9 tests   against a live asdb, skipped without one
+
+THE FIXTURE THAT SPANS BOTH. wire.rs and AbpCodec.java are two implementations
+of one format with no shared schema, no code generation, and nothing that fails
+at compile time when they drift. Round-trip tests cannot catch that: an encoder
+and a decoder written together agree with each other even when both are wrong.
+
+So one telemetry document is encoded to a hex string that is asserted on BOTH
+sides, in test_encoding_matches_the_java_side_byte_for_byte and in
+encodingMatchesTheRustSideByteForByte. Either implementation changing its mind
+fails a test.
+
+That fixture is why Java sorts its keys. wire.rs sorted because a HashMap's
+iteration order varies per run and an encoding that reorders its own fields
+cannot be diffed or checksummed. Java had no such problem, using LinkedHashMap,
+and originally did not sort. Sorting on both sides is what makes ONE logical
+document have ONE byte encoding regardless of which language produced it, and
+that is the property the shared fixture tests. The cost is a sort of about
+seven keys against 1.55 us of storage work per document.
+
+wire.rs covers every value variant round-tripping, i64 past 2^53 surviving
+exactly, deterministic output regardless of HashMap order, nested documents,
+and three hostile inputs: every truncation of a valid frame, a string claiming
+4 GB inside a 9-byte frame, and invalid UTF-8. Truncation is checked at every
+possible cut point rather than one, because "handles a short read" is a claim
+about all of them.
+
+binserver.rs covers ping, binary insert being readable by a text query (the two
+paths are one database), 200 requests on one connection, pipelined replies in
+order, error recovery, unknown opcodes, insert into a missing collection,
+OP_CLOSE, an oversized length header rejected before allocating, the injection
+test above, and 8 concurrent connections against one database.
+
+The Java tests cover the same encoding claims plus the ones only a server can
+answer: that a binary insert is findable by an ASL query, that both transports
+store identical documents field by field, that a batch of 250 all lands, that a
+pooled connection survives 200 reuses, that 8 concurrent virtual threads never
+read each other's replies, and that an unreachable server raises rather than
+hangs.
+
+REPRODUCING THE NUMBERS
+
+    cargo run --release --bin abpbench
+
+It builds its own temp database, binds both listeners on ephemeral ports, warms
+every path, and deletes the file afterwards. Nothing needs to be running first.
+
+RUNNING THE SERVER
+
+    asdb telemetry.db --port 7070 --abp-port 7071 --ttl telemtry_snapshots.receivedAt=7d
+
+    --abp-port 0 disables the binary listener.
+
+SHAYVERI selects the transport with shayveri.store.asdb.protocol, which
+defaults to binary. Set it to http to fall back; nothing else changes, because
+both sit behind the same Transport seam inside AsdbTelemetryStore.
+    Both bind 127.0.0.1 by default: there is no authentication and no TLS on
+    either, so exposing one takes an explicit --bind.
+
+
+================================================================================
+8.  WHAT ABP DOES NOT DO
+================================================================================
+
+No authentication, no TLS. Same as the HTTP listener. Anyone who can reach the
+port can read and delete everything.
+
+No transactions. A failure partway through a batch leaves earlier documents
+written.
+
+No fsync, as in section 4.
+
+No compatibility promise yet. There is no version byte in the frame, because
+there is exactly one implementation of each side and adding a negotiation
+nobody uses is a cost with no buyer. The moment a second version exists, it
+arrives as a new opcode rather than a changed one: the opcode space is 8 bits
+and 8 values are used.
+
+Statements serialise behind one mutex, so concurrent connections queue.
+Throughput scales with batch size, not with connection count.
