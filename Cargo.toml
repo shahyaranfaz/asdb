@@ -1,7 +1,12 @@
 [package]
 name = "asdb"
-version = "1.0.0"
+version = "0.1.0-dev"
 edition = "2021"
+authors = ["Shahyar Anfaz", "Averi Wylie"]
+description = "An experimental document database with ASL queries and HTTP and ABP/1 interfaces"
+repository = "https://github.com/shahyaranfaz/asdb"
+readme = "README.md"
+license = "MIT"
 
 [dependencies]
 

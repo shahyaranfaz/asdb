@@ -2,15 +2,9 @@
 
 A dependency-free, from-scratch document database written in Rust.
 
-asdb implements its own page storage, buffer pool, slotted heap files, persistent
-catalog, B-tree indexes, document codec, query planner, iterator-based execution,
-and HTTP interface. Queries are written in **ASL (Ave-Shay Language)**, a compact
-pipeline language whose reading order matches its execution order.
+asdb implements its own page storage, buffer pool, slotted heap files, persistent catalog, B-tree indexes, document codec, query planner, iterator-based execution, and 2 network interfaces: HTTP/1.1 and the binary ABP/1 protocol. Queries are written in **ASL (Ave-Shay Language)**, a compact pipeline language whose reading order matches its execution order.
 
-> **Status:** active development. The implemented storage, indexing, document,
-> query, HTTP, and TTL paths pass 219 tests (3 additional stress tests are
-> ignored by default). See [Current limitations](#current-limitations) before
-> using asdb outside a local development environment.
+> **Status: unreleased and under active development.** APIs, protocols, and on-disk formats may change without compatibility guarantees. The implemented storage, indexing, document, query, HTTP, ABP/1, and TTL paths pass 239 tests; 3 additional stress tests are ignored by default. See [Current limitations](#current-limitations) before experimenting with asdb outside a local development environment.
 
 ## Highlights
 
@@ -25,6 +19,7 @@ pipeline language whose reading order matches its execution order.
 - ASL lexer, parser, binder, planner, and lazy iterator-based executor
 - Filters, projection, ordering, pagination, aggregation, joins, and mutations
 - Minimal HTTP/1.1 interface returning JSON
+- Persistent ABP/1 connections with text-query and binary-document operations
 - Optional TTL policies with a background expiry sweeper
 - No runtime crate dependencies
 
@@ -45,6 +40,8 @@ GET  /health
 POST /query
 ```
 
+The ABP/1 binary interface listens on `127.0.0.1:7071` by default. Disable it with `--abp-port 0` or select another port with `--abp-port N`. Its framing, opcodes, value encoding, limits, and benchmark methodology are documented in [PROTOCOL.txt](PROTOCOL.txt).
+
 Run a query by sending an ASL statement as the request body:
 
 ```bash
@@ -63,6 +60,7 @@ Custom port, bind address, and repeatable TTL policies are supported:
 ```bash
 cargo run --release -- telemetry.db \
   --port 7070 \
+  --abp-port 7071 \
   --ttl telemetry.received_at=7d
 ```
 
@@ -110,11 +108,13 @@ The complete language reference is in [asl.txt](asl.txt).
 ## Architecture
 
 ```text
-HTTP / JSON
-    |
-ASL lexer -> parser -> binder -> planner
-    |
-lazy physical operators
+HTTP / JSON -----+
+                 +-> ASL lexer -> parser -> binder -> planner
+ABP/1 EXEC -------+                                  |
+                                                     v
+                                           lazy physical operators
+                                                     |
+ABP/1 INSERT ----------------------------------------+
     |
 Database / catalog / index manager
     |
@@ -151,13 +151,9 @@ operators, and evaluated through lazy iterators. The planner can select indexed
 access for supported predicates; execution supports scans, filters, projection,
 ordering, grouping, joins, pagination, and mutations.
 
-### HTTP and TTL
+### Network interfaces and TTL
 
-The binary exposes a deliberately small HTTP/1.1 surface so non-Rust clients can
-query asdb without a custom driver. Each connection runs on its own thread while
-database statements are serialized through one mutex. TTL policies periodically
-remove documents whose integer timestamp field is older than the configured
-duration.
+The binary exposes a small HTTP/1.1 surface for JSON responses and an ABP/1 interface for persistent, length-prefixed binary connections. Both listeners share the same database and query engine. Each connection runs on its own thread while database statements are serialized through one mutex. TTL policies periodically remove documents whose integer timestamp field is older than the configured duration.
 
 ## Benchmarks
 
@@ -183,10 +179,7 @@ The full command, results, and machine information are preserved in
 cargo test
 ```
 
-The suite covers persistence, page allocation, buffer-pool eviction, heap-file
-round trips, document encoding, catalog recovery, B-tree operations, index
-maintenance, parsing and binding, physical planning, query execution, HTTP
-lifecycle behavior, concurrent request serialization, and TTL expiry.
+The suite covers persistence, page allocation, buffer-pool eviction, heap-file round trips, document encoding, catalog recovery, B-tree operations, index maintenance, parsing and binding, physical planning, query execution, HTTP and ABP/1 lifecycle behavior, wire encoding, concurrent request serialization, and TTL expiry. The last intentional run completed 239 tests successfully with 3 ignored stress tests.
 
 Larger storage stress tests are marked ignored:
 
@@ -196,6 +189,8 @@ cargo test -- --ignored
 
 ## Current limitations
 
+- No stable release, compatibility policy, or migration tooling
+- APIs, ABP/1 framing, ASL syntax, and the on-disk format may change
 - No transactions or multi-statement atomicity
 - No authentication, TLS, or user permissions
 - One database statement executes at a time
@@ -212,6 +207,11 @@ service boundary.
 - [asl.txt](asl.txt) — language specification and examples
 - [plans.txt](plans.txt) — implementation phases, completed work, and roadmap
 - [phase3_bench.txt](phase3_bench.txt) — raw B-tree benchmark output
+- [PROTOCOL.txt](PROTOCOL.txt) — ABP/1 framing, decisions, and measurements
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Authors
 
