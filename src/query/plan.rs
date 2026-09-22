@@ -23,7 +23,7 @@ Children are Box<PhysicalOp> for the same reason Expr boxes itself: a
 recursive enum needs indirection or it has no finite size.
 */
 
-use crate::asl::{Assignment, Expr, OrderKey, SelectItem};
+use crate::asl::{Assignment, DocLiteral, Expr, OrderKey, SelectItem};
 use crate::document::{Document, Value};
 
 /*
@@ -165,6 +165,18 @@ pub enum PhysicalOp {
         collection: String,
         assignments: Vec<Assignment>,
     },
+    /*
+    Upsert: update every row the input produced with this document's fields,
+    or insert the document when the input produced none.
+
+    It wraps the input rather than being a leaf like Insert, because deciding
+    between the two paths means knowing whether anything matched.
+    */
+    Upsert {
+        input: Box<PhysicalOp>,
+        collection: String,
+        doc: DocLiteral,
+    },
     Delete {
         input: Box<PhysicalOp>,
         collection: String,
@@ -185,6 +197,7 @@ impl PhysicalOp {
             | PhysicalOp::IndexScan { collection, .. }
             | PhysicalOp::Insert { collection, .. }
             | PhysicalOp::Update { collection, .. }
+            | PhysicalOp::Upsert { collection, .. }
             | PhysicalOp::Delete { collection, .. } => Some(collection),
 
             PhysicalOp::Filter { input, .. }

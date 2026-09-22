@@ -76,6 +76,10 @@ impl Database {
         self.catalog.collection_root(name).is_some()
     }
 
+    pub fn has_compound_index(&self, collection: &str, fields: &[String]) -> bool {
+        self.catalog.has_index(collection, &crate::btree::join_fields(fields))
+    }
+
     pub fn has_index(&self, collection: &str, field: &str) -> bool {
         self.catalog.has_index(collection, field)
     }
@@ -126,10 +130,31 @@ impl Database {
     }
 
     pub fn create_index(&mut self, collection: &str, field: &str) -> DatabaseResult<()> {
+        self.create_index_with(collection, field, false)
+    }
+
+    /*
+    create_index_with: the same, but the index can reject duplicates.
+
+    A unique index is checked on every later insert, and creating one over data
+    that already has duplicates fails rather than silently claiming a property
+    the data does not have.
+    */
+    pub fn create_index_with(&mut self, collection: &str, field: &str, unique: bool) -> DatabaseResult<()> {
+        self.create_index_on(collection, std::slice::from_ref(&field.to_string()), unique)
+    }
+
+    /*
+    create_index_on: one index over one or more fields.
+
+    A compound index is only used for uniqueness today; the planner asks for
+    indexes by a single field name and never sees these.
+    */
+    pub fn create_index_on(&mut self, collection: &str, fields: &[String], unique: bool) -> DatabaseResult<()> {
         let (catalog, pool) = self.catalog_and_pool();
         {
             let mut indexes = IndexManager::new(catalog, pool);
-            indexes.create(collection, field)?;
+            indexes.create_compound(collection, fields, unique)?;
         }
         self.pool.flush_all()?;
         Ok(())
@@ -172,6 +197,18 @@ impl Database {
     ) -> DatabaseResult<Vec<DocId>> {
         if docs.is_empty() {
             return Ok(Vec::new());
+        }
+
+        /*
+        Unique indexes are checked FIRST, for the whole batch, so a rejected
+        insert leaves nothing written. Checking as we go would leave the
+        documents before the offending one stored, which is the worst of both:
+        not atomic, and not refused.
+        */
+        {
+            let (catalog, pool) = self.catalog_and_pool();
+            let mut indexes = IndexManager::new(catalog, pool);
+            indexes.check_unique_batch(collection, docs)?;
         }
 
         let (catalog, pool) = self.catalog_and_pool();
@@ -261,6 +298,41 @@ impl Database {
             }
         }
         Ok(out)
+    }
+
+    /*
+    upsert_by: write one document, matched on a field's value.
+
+    The whole thing happens under one call, so nothing can slip between the
+    lookup and the write. Matching documents keep the fields the new document
+    does not mention, as `update set` would.
+
+    The field must be indexed: this exists for the hot path, where the caller
+    is addressing a document by its id, and a sequential scan per write is not
+    that path. An unindexed field is an error rather than a silent scan.
+    */
+    pub fn upsert_by(&mut self, collection: &str, field: &str, value: &Value,
+                     doc: &Document) -> DatabaseResult<usize> {
+        let existing = self.search_index(collection, field, value)?;
+        match existing {
+            Some((doc_id, mut current)) => {
+                for (name, v) in doc.iter() {
+                    current.insert(name.clone(), v.clone());
+                }
+                {
+                    let (catalog, pool) = self.catalog_and_pool();
+                    let mut indexes = IndexManager::new(catalog, pool);
+                    indexes.check_unique_except(collection, &current, Some(doc_id))?;
+                }
+                self.delete_doc(collection, doc_id)?;
+                self.insert_doc(collection, &current)?;
+                Ok(1)
+            }
+            None => {
+                self.insert_doc(collection, doc)?;
+                Ok(1)
+            }
+        }
     }
 
     pub fn search_index(
@@ -536,6 +608,44 @@ mod tests {
 
         assert_eq!(db.search_index("c", "n", &Value::Int(7)).unwrap().map(|(id, _)| id), Some(ids[7]));
         assert_eq!(db.range_index("c", "n", &Value::Int(5), &Value::Int(8)).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_unique_batch_rejects_its_own_duplicate_without_writing_anything() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("c").unwrap();
+        db.create_index_with("c", "id", true).unwrap();
+
+        let first = user_doc(7, 20, "first");
+        let second = user_doc(7, 21, "second");
+        assert!(db.insert_docs("c", &[first, second]).is_err());
+        assert!(db.scan_collection("c").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_upsert_unique_conflict_keeps_the_original_document() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut db = Database::create(tmp.path()).unwrap();
+        db.create_collection("c").unwrap();
+        db.create_index_with("c", "id", true).unwrap();
+        db.create_index_with("c", "email", true).unwrap();
+
+        let mut alice = user_doc(1, 20, "alice");
+        alice.insert("email".into(), Value::String("alice@example.test".into()));
+        let mut bob = user_doc(2, 21, "bob");
+        bob.insert("email".into(), Value::String("bob@example.test".into()));
+        db.insert_docs("c", &[alice.clone(), bob]).unwrap();
+
+        let mut change = Document::new();
+        change.insert("email".into(), Value::String("bob@example.test".into()));
+        assert!(db.upsert_by("c", "id", &Value::Int(1), &change).is_err());
+
+        assert_eq!(
+            db.search_index("c", "id", &Value::Int(1)).unwrap().map(|(_, doc)| doc),
+            Some(alice),
+        );
+        assert_eq!(db.scan_collection("c").unwrap().len(), 2);
     }
 
     #[test]

@@ -139,6 +139,10 @@ fn dispatch(
             Ok(n) => reply_affected(out, n as u64),
             Err(e) => reply_error(out, &e),
         },
+        OP_UPSERT => match do_upsert(payload, db) {
+            Ok(n) => reply_affected(out, n as u64),
+            Err(e) => reply_error(out, &e),
+        },
         OP_EXEC => match do_exec(payload, db) {
             Ok(output) => reply_output(out, &output),
             Err(e) => reply_error(out, &e),
@@ -177,6 +181,27 @@ fn do_insert(payload: &[u8], db: &Arc<Mutex<Database>>) -> Result<usize, String>
         .map_err(|e| format!("{e:?}"))
 }
 
+/*
+OP_UPSERT: [u32 collection_len][collection][u32 field_len][field][value][document body]
+
+The same write AS-CORE makes on every save: address one document by a field's
+value, and write it whether or not it is there. Binary for the same reason
+OP_INSERT is: the values never become ASL text, so nothing has to be escaped
+and nothing can be mistaken for syntax.
+*/
+fn do_upsert(payload: &[u8], db: &Arc<Mutex<Database>>) -> Result<usize, String> {
+    let mut r = Reader::new(payload);
+    let collection = r.str().map_err(|e| e.to_string())?;
+    let field = r.str().map_err(|e| e.to_string())?;
+    let value = r.value().map_err(|e| e.to_string())?;
+    let doc = r.document_body().map_err(|e| e.to_string())?;
+
+    let mut guard = db.lock().map_err(|_| "database lock poisoned".to_string())?;
+    guard
+        .upsert_by(&collection, &field, &value, &doc)
+        .map_err(|e| format!("{e:?}"))
+}
+
 /// OP_EXEC: [u32 len][ASL text]. The general path, same engine as HTTP.
 fn do_exec(payload: &[u8], db: &Arc<Mutex<Database>>) -> Result<QueryOutput, String> {
     let mut r = Reader::new(payload);
@@ -198,6 +223,8 @@ fn do_exec(payload: &[u8], db: &Arc<Mutex<Database>>) -> Result<QueryOutput, Str
             let physical = plan(db, &pipeline).map_err(|e| e.to_string())?;
             execute(db, &physical).map_err(|e| e.to_string())
         }
+        // a guarded create or drop whose object was already in the state asked for
+        BoundStatement::NoOp => Ok(QueryOutput::Affected(0)),
         BoundStatement::CreateCollection { name, .. } => db
             .create_collection(&name)
             .map(|()| QueryOutput::Affected(1))
@@ -206,8 +233,8 @@ fn do_exec(payload: &[u8], db: &Arc<Mutex<Database>>) -> Result<QueryOutput, Str
             .drop_collection(&name)
             .map(|()| QueryOutput::Affected(1))
             .map_err(|e| format!("{e:?}")),
-        BoundStatement::CreateIndex { collection, field } => db
-            .create_index(&collection, &field)
+        BoundStatement::CreateIndex { collection, fields, unique } => db
+            .create_index_on(&collection, &fields, unique)
             .map(|()| QueryOutput::Affected(1))
             .map_err(|e| format!("{e:?}")),
         BoundStatement::DropIndex { collection, field } => db
@@ -363,6 +390,39 @@ mod tests {
         d.insert("placeId".into(), Value::String(place.into()));
         d.insert("playerCount".into(), Value::Int(42));
         d
+    }
+
+    #[test]
+    fn test_binary_upsert_inserts_then_merges_without_a_socket() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut database = Database::create(tmp.path()).unwrap();
+        database.create_collection("nodes").unwrap();
+        database.create_index("nodes", "nodeId").unwrap();
+        let db = Arc::new(Mutex::new(database));
+
+        let mut initial = Document::new();
+        initial.insert("nodeId".into(), Value::String("n1".into()));
+        initial.insert("load".into(), Value::Int(3));
+        let mut first = Vec::new();
+        put_str(&mut first, "nodes");
+        put_str(&mut first, "nodeId");
+        put_value(&mut first, &Value::String("n1".into()));
+        put_document_body(&mut first, &initial);
+        assert_eq!(do_upsert(&first, &db).unwrap(), 1);
+
+        let mut patch = Document::new();
+        patch.insert("nodeId".into(), Value::String("n1".into()));
+        patch.insert("load".into(), Value::Int(9));
+        let mut second = Vec::new();
+        put_str(&mut second, "nodes");
+        put_str(&mut second, "nodeId");
+        put_value(&mut second, &Value::String("n1".into()));
+        put_document_body(&mut second, &patch);
+        assert_eq!(do_upsert(&second, &db).unwrap(), 1);
+
+        let rows = db.lock().unwrap().scan_collection("nodes").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["load"], Value::Int(9));
     }
 
     #[test]

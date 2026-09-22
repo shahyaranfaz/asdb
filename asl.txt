@@ -313,6 +313,19 @@ return a result summary { affected: n }.
         Example:
             from orders | where status == "pending" | update set retries = retries + 1
 
+    upsert { key: val, ... }
+        Writes one document whether or not it is already there. Every matching
+        document is updated with the fields given, keeping the fields the
+        document does not mention; if nothing matched, the document is
+        inserted as it stands. Affected counts the rows written either way, so
+        an insert reports 1.
+        Example:
+            from nodes | where nodeId == "n1" | upsert { nodeId: "n1", load: 3 }
+
+        Without this, a client does an update, reads the affected count, and
+        inserts when it was zero. Those are two statements with a gap between
+        them, so two writers can both see zero and both insert.
+
     delete
         Deletes all documents passing through the pipeline.
         Example:
@@ -352,8 +365,9 @@ and scalar fields may be indexed whether or not they are declared.
 
 CURRENT RUNTIME LIMITATION:
 Schema declarations are parsed and duplicate field declarations are rejected,
-but schema metadata is not yet persisted. Field types, required, and unique
-constraints are therefore not enforced on insert in v1.0.0.
+but schema metadata is not yet persisted. Field types and required are
+therefore not enforced on insert. Uniqueness IS enforced, but only through a
+unique index (see INDEX DEFINITION), not through the inline schema keyword.
 
     create <collection> { <field>: <type>, ... }
 
@@ -371,18 +385,64 @@ constraints are therefore not enforced on insert in v1.0.0.
     Drop a collection:
         drop collection <name>
 
+    Existence guards (optional):
+        create if not exists <collection> { ... }
+        drop collection if exists <name>
+
+    A guarded statement whose object is already in the state asked for does
+    nothing and reports {"affected": 0} instead of failing. Without the guard,
+    creating an existing collection or dropping a missing one is an error.
+
+    This is for startup DDL, which a client runs on every boot: without it,
+    such a client has to send statements it expects to fail and then tell a
+    benign "already exists" apart from a real failure by reading the message.
+
 ----------------------------------------------------------------
 INDEX DEFINITION
 ----------------------------------------------------------------
     create index on <collection>.<field>
     drop index on <collection>.<field>
 
+    create unique index on <collection>.<field>
+    create unique index on <collection>.<field>, <collection>.<field>, ...
+
+    create index if not exists on <collection>.<field>
+    drop index if exists on <collection>.<field>
+
     Examples:
         create index on users.id
+        create index if not exists on users.id
 
-The parser recognizes composite index declarations so that syntax is reserved,
-but the v1.0.0 binder rejects them because the runtime index layer supports
-only one field per index.
+    The guards behave as they do for collections: already present, or already
+    absent, reports {"affected": 0} rather than an error.
+
+    A UNIQUE index rejects an insert whose value the index already holds, and
+    the check runs before anything is written, so a refused batch leaves
+    nothing behind. A document that does not have the field at all is allowed:
+    the index stores no entry for it, so there is nothing to collide with.
+
+    Creating a unique index over data that already contains duplicates fails,
+    rather than creating an index that claims a property the data does not
+    have.
+
+    Uniqueness is persisted with the index, so it still holds after a restart.
+    Uniqueness may cover several fields; see the composite note below.
+
+A composite index is accepted when it is UNIQUE, which is what a constraint
+over a combination needs:
+
+        create unique index on config_versions.placeId,
+                               config_versions.namespace,
+                               config_versions.version
+
+Its key is each field's value in order, length-prefixed, so "ab" and "c"
+cannot collide with "a" and "bc". A document missing any of the fields is not
+indexed, and so is not constrained: a partial key would sort among the
+complete ones.
+
+A composite index that is NOT unique is still rejected. The planner looks
+indexes up one field at a time, so it would be maintained on every insert
+while never answering a query.
 
 ----------------------------------------------------------------
 RESULT FORMAT

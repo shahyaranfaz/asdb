@@ -3,4 +3,4 @@ mod index;
 mod node;
 
 pub use btree::BTree;
-pub use index::IndexManager;
+pub use index::{join_fields, IndexManager};

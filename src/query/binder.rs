@@ -10,38 +10,52 @@ pub enum BoundStatement {
     Pipeline(Pipeline),
     CreateCollection { name: String, schema: Vec<SchemaField> },
     DropCollection { name: String },
-    CreateIndex { collection: String, field: String },
+    CreateIndex { collection: String, fields: Vec<String>, unique: bool },
     DropIndex { collection: String, field: String },
+    /// A guarded DDL statement whose object was already in the state asked for.
+    NoOp,
 }
 
 pub fn bind(db: &Database, statement: Statement) -> QueryResult<BoundStatement> {
     match statement {
         Statement::Pipeline(stages) => bind_pipeline(db, stages),
-        Statement::CreateCollection { name, schema } => {
+        Statement::CreateCollection { name, schema, if_not_exists } => {
             if db.has_collection(&name) {
+                if if_not_exists {
+                    return Ok(BoundStatement::NoOp);
+                }
                 return Err(QueryError::Validation(format!("collection already exists: {name}")));
             }
             validate_schema(&schema)?;
             Ok(BoundStatement::CreateCollection { name, schema })
         }
-        Statement::DropCollection { name } => {
+        Statement::DropCollection { name, if_exists } => {
             if !db.has_collection(&name) {
+                if if_exists {
+                    return Ok(BoundStatement::NoOp);
+                }
                 return Err(QueryError::Validation(format!("collection not found: {name}")));
             }
             Ok(BoundStatement::DropCollection { name })
         }
-        Statement::CreateIndex { collection, fields } => {
-            let field = bind_single_index_field(db, &collection, fields)?;
-            if db.has_index(&collection, &field) {
+        Statement::CreateIndex { collection, fields, if_not_exists, unique } => {
+            let fields = bind_index_fields(db, &collection, fields, unique)?;
+            if db.has_compound_index(&collection, &fields) {
+                if if_not_exists {
+                    return Ok(BoundStatement::NoOp);
+                }
                 return Err(QueryError::Validation(format!(
-                    "index already exists: {collection}.{field}"
+                    "index already exists: {collection}.{}", fields.join(", ")
                 )));
             }
-            Ok(BoundStatement::CreateIndex { collection, field })
+            Ok(BoundStatement::CreateIndex { collection, fields, unique })
         }
-        Statement::DropIndex { collection, fields } => {
+        Statement::DropIndex { collection, fields, if_exists } => {
             let field = bind_single_index_field(db, &collection, fields)?;
             if !db.has_index(&collection, &field) {
+                if if_exists {
+                    return Ok(BoundStatement::NoOp);
+                }
                 return Err(QueryError::Validation(format!(
                     "index not found: {collection}.{field}"
                 )));
@@ -62,6 +76,30 @@ fn bind_single_index_field(db: &Database, collection: &str,
         ));
     }
     Ok(fields.into_iter().next().unwrap())
+}
+
+/*
+bind_index_fields: several fields are allowed only for a unique index.
+
+A compound index exists to enforce uniqueness across a combination. The planner
+still looks indexes up one field at a time, so a non-unique compound index would
+be written and maintained on every insert while never answering a query, which
+is cost without benefit.
+*/
+fn bind_index_fields(db: &Database, collection: &str, fields: Vec<String>,
+                     unique: bool) -> QueryResult<Vec<String>> {
+    if !db.has_collection(collection) {
+        return Err(QueryError::Validation(format!("collection not found: {collection}")));
+    }
+    if fields.is_empty() {
+        return Err(QueryError::Validation("an index needs at least one field".to_string()));
+    }
+    if fields.len() > 1 && !unique {
+        return Err(QueryError::Unsupported(
+            "composite indexes are supported only as unique constraints".to_string(),
+        ));
+    }
+    Ok(fields)
 }
 
 fn bind_pipeline(db: &Database, stages: Pipeline) -> QueryResult<BoundStatement> {
@@ -104,6 +142,14 @@ fn bind_pipeline(db: &Database, stages: Pipeline) -> QueryResult<BoundStatement>
                 if assignments.is_empty() {
                     return Err(QueryError::InvalidPipeline(
                         "update requires at least one assignment".to_string(),
+                    ));
+                }
+            }
+            Stage::Upsert { doc } => {
+                ensure_terminal(&stages, i, "upsert")?;
+                if doc.fields.is_empty() {
+                    return Err(QueryError::InvalidPipeline(
+                        "upsert requires a document with at least one field".to_string(),
                     ));
                 }
             }
@@ -271,6 +317,7 @@ mod tests {
                     unique: false,
                 },
             ],
+            if_not_exists: false,
         };
 
         assert!(matches!(bind(&db, stmt), Err(QueryError::Validation(_))));
@@ -314,11 +361,45 @@ mod tests {
     }
 
     #[test]
+    fn test_guarded_create_on_existing_collection_is_a_no_op() {
+        let (db, _tmp) = db_with_users();
+        let stmt = Statement::CreateCollection {
+            name: "users".to_string(),
+            schema: vec![],
+            if_not_exists: true,
+        };
+
+        assert!(matches!(bind(&db, stmt), Ok(BoundStatement::NoOp)));
+    }
+
+    #[test]
+    fn test_guarded_drop_of_missing_collection_is_a_no_op() {
+        let (db, _tmp) = db_with_users();
+        let stmt = Statement::DropCollection { name: "ghosts".to_string(), if_exists: true };
+
+        assert!(matches!(bind(&db, stmt), Ok(BoundStatement::NoOp)));
+    }
+
+    #[test]
+    fn test_unguarded_create_on_existing_collection_still_errors() {
+        let (db, _tmp) = db_with_users();
+        let stmt = Statement::CreateCollection {
+            name: "users".to_string(),
+            schema: vec![],
+            if_not_exists: false,
+        };
+
+        assert!(matches!(bind(&db, stmt), Err(QueryError::Validation(_))));
+    }
+
+    #[test]
     fn test_bind_rejects_composite_runtime_index() {
         let (db, _tmp) = db_with_users();
         let stmt = Statement::CreateIndex {
             collection: "users".to_string(),
             fields: vec!["age".to_string(), "id".to_string()],
+                if_not_exists: false,
+                unique: false,
         };
 
         assert!(matches!(bind(&db, stmt), Err(QueryError::Unsupported(_))));

@@ -42,10 +42,10 @@ variants.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
     Pipeline(Pipeline),
-    CreateCollection { name: String, schema: Vec<SchemaField> },
-    DropCollection { name: String },
-    CreateIndex { collection: String, fields: Vec<String> },
-    DropIndex { collection: String, fields: Vec<String> },
+    CreateCollection { name: String, schema: Vec<SchemaField>, if_not_exists: bool },
+    DropCollection { name: String, if_exists: bool },
+    CreateIndex { collection: String, fields: Vec<String>, if_not_exists: bool, unique: bool },
+    DropIndex { collection: String, fields: Vec<String>, if_exists: bool },
 }
 
 pub type Pipeline = Vec<Stage>;
@@ -97,6 +97,11 @@ pub enum Stage {
     },
     Update {
         assignments: Vec<Assignment>,
+    },
+    Upsert {
+        // the document to write: applied to every matched row, or inserted when
+        // nothing matched. one literal, since an upsert addresses one thing.
+        doc: DocLiteral,
     },
     Delete,
 }

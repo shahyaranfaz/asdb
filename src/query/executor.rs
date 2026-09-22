@@ -48,7 +48,7 @@ then HashJoin.
 
 
 use super::{QueryError, QueryResult};
-use crate::asl::{Assignment, Direction, Expr, OrderKey, SelectItem};
+use crate::asl::{Assignment, Direction, DocLiteral, Expr, OrderKey, SelectItem};
 use crate::database::Database;
 use crate::document::{Document, Value};
 use crate::query::evaluate::{compare_values, evaluate, evaluate_bool, values_equal};
@@ -139,7 +139,10 @@ only place that decides between the two QueryOutput shapes.
 pub fn execute(db: &mut Database, plan: &PhysicalOp) -> QueryResult<QueryOutput> {
     let mutating = matches!(
         plan,
-        PhysicalOp::Insert { .. } | PhysicalOp::Update { .. } | PhysicalOp::Delete { .. }
+        PhysicalOp::Insert { .. }
+            | PhysicalOp::Update { .. }
+            | PhysicalOp::Upsert { .. }
+            | PhysicalOp::Delete { .. }
     );
 
     let mut op = build(plan)?;
@@ -201,6 +204,12 @@ fn build(plan: &PhysicalOp) -> QueryResult<Box<dyn Operator>> {
             input: build(input)?,
             collection: collection.clone(),
             assignments: assignments.clone(),
+        }),
+        PhysicalOp::Upsert { input, collection, doc } => Box::new(Upsert {
+            input: build(input)?,
+            collection: collection.clone(),
+            doc: doc.clone(),
+            written: None,
         }),
         PhysicalOp::Delete { input, collection } => {
             Box::new(Delete { input: build(input)?, collection: collection.clone(), deleted: None })
@@ -909,6 +918,75 @@ impl Operator for Update {
         ctx.db.delete_doc(&self.collection, doc_id)?;
         let new_id = ctx.db.insert_doc(&self.collection, &updated)?;
         Ok(Some(Row::stored(new_id, updated)))
+    }
+}
+
+/*
+Upsert: write one document, whether or not it is already there.
+
+Drains the input on the first call, because the choice between updating and
+inserting cannot be made until the whole matched set is known: one row short of
+the end still looks like "nothing matched".
+
+A matched row keeps every field the document does not mention, exactly as
+`update set` would; nothing matched means the document is inserted as it stands.
+Affected is the number of rows written either way, so an insert reports 1.
+*/
+struct Upsert {
+    input: Box<dyn Operator>,
+    collection: String,
+    doc: DocLiteral,
+    written: Option<std::vec::IntoIter<Row>>,
+}
+
+impl Upsert {
+    // the document as literal values, evaluated against a row, or against an
+    // empty document when there is no row to evaluate against
+    fn materialise(&self, against: &Document) -> QueryResult<Document> {
+        let mut doc = Document::new();
+        for (name, expr) in &self.doc.fields {
+            doc.insert(name.clone(), evaluate(expr, against)?);
+        }
+        Ok(doc)
+    }
+}
+
+impl Operator for Upsert {
+    fn next(&mut self, ctx: &mut ExecContext) -> QueryResult<Option<Row>> {
+        if self.written.is_none() {
+            let mut matched = Vec::new();
+            while let Some(row) = self.input.next(ctx)? {
+                matched.push(row);
+            }
+
+            let mut rows = Vec::new();
+            if matched.is_empty() {
+                let doc = self.materialise(&Document::new())?;
+                let id = ctx.db.insert_doc(&self.collection, &doc)?;
+                rows.push(Row::stored(id, doc));
+            } else {
+                for row in matched {
+                    let Some(doc_id) = row.doc_id else {
+                        return Err(QueryError::InvalidPipeline(
+                            "upsert needs stored rows; a projection before upsert discards their identity"
+                                .to_string(),
+                        ));
+                    };
+
+                    let fields = self.materialise(&row.doc)?;
+                    let mut updated = row.doc.clone();
+                    for (name, value) in fields.iter() {
+                        updated.insert(name.clone(), value.clone());
+                    }
+
+                    ctx.db.delete_doc(&self.collection, doc_id)?;
+                    let new_id = ctx.db.insert_doc(&self.collection, &updated)?;
+                    rows.push(Row::stored(new_id, updated));
+                }
+            }
+            self.written = Some(rows.into_iter());
+        }
+        Ok(self.written.as_mut().expect("just filled").next())
     }
 }
 

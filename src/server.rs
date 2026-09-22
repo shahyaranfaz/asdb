@@ -280,6 +280,8 @@ fn run_statement(source: &str, db: &Arc<Mutex<Database>>) -> (&'static str, Stri
 
         // DDL. Reported as an affected count so every response has one of the
         // two shapes asl.txt defines, rather than inventing a third.
+        // a guarded create or drop whose object was already in the state asked for
+        BoundStatement::NoOp => QueryOutput::Affected(0),
         BoundStatement::CreateCollection { name, .. } => match db.create_collection(&name) {
             Ok(()) => QueryOutput::Affected(1),
             Err(err) => {
@@ -290,8 +292,8 @@ fn run_statement(source: &str, db: &Arc<Mutex<Database>>) -> (&'static str, Stri
             Ok(()) => QueryOutput::Affected(1),
             Err(err) => return ("400 Bad Request", write_error(&format!("{err:?}"), "drop")),
         },
-        BoundStatement::CreateIndex { collection, field } => {
-            match db.create_index(&collection, &field) {
+        BoundStatement::CreateIndex { collection, fields, unique } => {
+            match db.create_index_on(&collection, &fields, unique) {
                 Ok(()) => QueryOutput::Affected(1),
                 Err(err) => {
                     return ("400 Bad Request", write_error(&format!("{err:?}"), "index"))

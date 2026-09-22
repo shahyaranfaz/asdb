@@ -13,7 +13,70 @@ impl<'a> IndexManager<'a> {
         IndexManager { catalog, pool }
     }
 
-    pub fn create(&mut self, collection: &str, field: &str) -> CatalogResult<()> {
+    /*
+    COMPOUND INDEXES are stored as one catalog entry whose field name is the
+    parts joined by FIELD_SEPARATOR, a byte no ASL identifier can contain. Its
+    btree key is each part's serialized value, length-prefixed so "ab" + "c"
+    and "a" + "bc" cannot collide.
+
+    Only uniqueness uses them today. The planner looks indexes up by a single
+    field name, which never matches a joined one, so a compound index is never
+    mistaken for one it could answer a query with.
+    */
+    pub fn create_compound(&mut self, collection: &str, fields: &[String], unique: bool) -> CatalogResult<()> {
+        if fields.len() == 1 {
+            return self.create(collection, &fields[0], unique);
+        }
+
+        self.catalog
+            .collection_root(collection)
+            .ok_or_else(|| CatalogError::CollectionNotFound(collection.to_string()))?;
+
+        let name = join_fields(fields);
+        let key = (collection.to_string(), name);
+        if self.catalog.indexes.contains_key(&key) {
+            return Err(CatalogError::IndexAlreadyExists(collection.to_string()));
+        }
+
+        let root = {
+            let btree = BTree::new(self.pool)?;
+            btree.root()
+        };
+
+        let existing = self.catalog.open_collection(self.pool, collection)?;
+        let docs = existing.scan(self.pool)?;
+        existing.flush(self.pool)?;
+
+        if unique {
+            let mut seen = std::collections::HashSet::new();
+            for (_, doc) in &docs {
+                if let Some(bytes) = compound_key(fields, doc) {
+                    if !seen.insert(bytes) {
+                        return Err(CatalogError::DuplicateKey(
+                            collection.to_string(),
+                            fields.join(", "),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut btree = BTree::open(root, self.pool);
+        for (doc_id, doc) in docs {
+            if let Some(bytes) = compound_key(fields, &doc) {
+                btree.insert(&bytes, doc_id)?;
+            }
+        }
+
+        self.catalog.indexes.insert(key.clone(), root);
+        if unique {
+            self.catalog.unique_indexes.insert(key);
+        }
+        self.catalog.flush()?;
+        Ok(())
+    }
+
+    pub fn create(&mut self, collection: &str, field: &str, unique: bool) -> CatalogResult<()> {
         self.catalog
             .collection_root(collection)
             .ok_or_else(|| CatalogError::CollectionNotFound(collection.to_string()))?;
@@ -38,6 +101,26 @@ impl<'a> IndexManager<'a> {
         let docs = existing.scan(self.pool)?;
         existing.flush(self.pool)?;
 
+        /*
+        A unique index is refused if the data already breaks it, rather than
+        being created and then lying: an index that claims uniqueness over
+        duplicates would let the next insert through on a check that is already
+        false.
+        */
+        if unique {
+            let mut seen = std::collections::HashSet::new();
+            for (_, doc) in &docs {
+                if let Some(value) = doc.get(field) {
+                    if !seen.insert(serialize_key(value)) {
+                        return Err(CatalogError::DuplicateKey(
+                            collection.to_string(),
+                            field.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
         let mut btree = BTree::open(root, self.pool);
         for (doc_id, doc) in docs {
             if let Some(value) = doc.get(field) {
@@ -46,7 +129,10 @@ impl<'a> IndexManager<'a> {
             }
         }
 
-        self.catalog.indexes.insert(key, root);
+        self.catalog.indexes.insert(key.clone(), root);
+        if unique {
+            self.catalog.unique_indexes.insert(key);
+        }
         self.catalog.flush()?;
         Ok(())
     }
@@ -60,6 +146,7 @@ impl<'a> IndexManager<'a> {
         let mut btree = BTree::open(root, self.pool);
         btree.free()?;
         self.catalog.indexes.remove(&key);
+        self.catalog.unique_indexes.remove(&key);
         self.catalog.flush()?;
         Ok(())
     }
@@ -72,13 +159,76 @@ impl<'a> IndexManager<'a> {
             .collect()
     }
 
+    /*
+    check_unique: refuse a document that would duplicate a unique index's value.
+
+    Run before anything is written, so a rejected insert leaves nothing behind.
+    A document that simply lacks the field is allowed: the index has no entry for
+    it, so there is nothing to collide with, which matches the index not storing
+    missing fields in the first place.
+    */
+    pub fn check_unique(&mut self, collection: &str, doc: &Document) -> CatalogResult<()> {
+        self.check_unique_except(collection, doc, None)
+    }
+
+    /*
+    Check a prospective document against every unique index. `except` is the
+    stored row being replaced, if any: its unchanged unique values must not be
+    treated as collisions with themselves.
+    */
+    pub fn check_unique_except(&mut self, collection: &str, doc: &Document, except: Option<DocId>) -> CatalogResult<()> {
+        let unique: Vec<String> = self.catalog.unique_index_fields(collection);
+        for name in unique {
+            let key = match index_key_for(&name, doc) {
+                Some(key) => key,
+                None => continue,
+            };
+            let root = match self.catalog.indexes.get(&(collection.to_string(), name.clone())) {
+                Some(root) => *root,
+                None => continue,
+            };
+
+            let mut btree = BTree::open(root, self.pool);
+            if let Some(found) = btree.search(&key)? {
+                if Some(found) != except {
+                    return Err(CatalogError::DuplicateKey(
+                        collection.to_string(),
+                        name.replace(FIELD_SEPARATOR, ", "),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate stored keys and duplicates inside a batch before changing a heap page.
+    pub fn check_unique_batch(&mut self, collection: &str, docs: &[Document]) -> CatalogResult<()> {
+        let mut seen = std::collections::HashSet::new();
+        let unique = self.catalog.unique_index_fields(collection);
+        for doc in docs {
+            self.check_unique(collection, doc)?;
+            for name in &unique {
+                let key = match index_key_for(name, doc) {
+                    Some(key) => key,
+                    None => continue,
+                };
+                if !seen.insert((name.clone(), key)) {
+                    return Err(CatalogError::DuplicateKey(
+                        collection.to_string(),
+                        name.replace(FIELD_SEPARATOR, ", "),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn on_insert(&mut self, collection: &str, doc: &Document,
                      doc_id: DocId) -> CatalogResult<()> {
 
         let index_keys: Vec<((String, String), PageId)> = self.indexes_for(collection);
         for ((_, field), root) in index_keys {
-            if let Some(value) = doc.get(&field) {
-                let key = serialize_key(value);
+            if let Some(key) = index_key_for(&field, doc) {
                 let mut btree = BTree::open(root, self.pool);
                 btree.insert(&key, doc_id)?;
             }
@@ -91,8 +241,7 @@ impl<'a> IndexManager<'a> {
 
         let index_keys: Vec<((String, String), PageId)> = self.indexes_for(collection);
         for ((_, field), root) in index_keys {
-            if let Some(value) = doc.get(&field) {
-                let key = serialize_key(value);
+            if let Some(key) = index_key_for(&field, doc) {
                 let mut btree = BTree::open(root, self.pool);
                 btree.delete(&key, doc_id)?;
             }
@@ -168,7 +317,7 @@ mod tests {
 
         {
             let mut indexes = IndexManager::new(&mut catalog, &mut pool);
-            indexes.create("users", "age").unwrap();
+            indexes.create("users", "age", false).unwrap();
         }
 
         let reopened = Catalog::open(tmp.path()).unwrap();
@@ -182,7 +331,7 @@ mod tests {
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
 
         assert!(matches!(
-            indexes.create("users", "age"),
+            indexes.create("users", "age", false),
             Err(CatalogError::CollectionNotFound(_))
         ));
     }
@@ -199,7 +348,7 @@ mod tests {
         let bob_id = users.insert(&mut pool, &bob).unwrap();
         users.flush(&mut pool).unwrap();
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
-        indexes.create("users", "age").unwrap();
+        indexes.create("users", "age", false).unwrap();
 
         assert_eq!(indexes.search("users", "age", &Value::Int(25)).unwrap(), Some(alice_id));
         assert_eq!(indexes.search("users", "age", &Value::Int(17)).unwrap(), Some(bob_id));
@@ -213,7 +362,7 @@ mod tests {
         users.flush(&mut pool).unwrap();
         {
             let mut indexes = IndexManager::new(&mut catalog, &mut pool);
-            indexes.create("users", "age").unwrap();
+            indexes.create("users", "age", false).unwrap();
         }
 
         let docs = vec![
@@ -249,7 +398,7 @@ mod tests {
         users.flush(&mut pool).unwrap();
         {
             let mut indexes = IndexManager::new(&mut catalog, &mut pool);
-            indexes.create("users", "age").unwrap();
+            indexes.create("users", "age", false).unwrap();
         }
 
         let doc = make_doc(1, 25, "alice");
@@ -278,7 +427,7 @@ mod tests {
         let (mut catalog, mut pool) = open_catalog_and_pool(tmp.path());
         catalog.create_collection(&mut pool, "users").unwrap();
         let mut indexes = IndexManager::new(&mut catalog, &mut pool);
-        indexes.create("users", "age").unwrap();
+        indexes.create("users", "age", false).unwrap();
         indexes.drop("users", "age").unwrap();
 
         assert!(!indexes.catalog.indexes.contains_key(&("users".to_string(), "age".to_string())));
@@ -287,4 +436,42 @@ mod tests {
             Err(CatalogError::IndexNotFound(_))
         ));
     }
+}
+
+/*
+The byte that joins a compound index's field names into one catalog entry.
+Chosen because an ASL identifier cannot contain it, so a joined name can never
+be confused with a real single field name.
+*/
+pub const FIELD_SEPARATOR: char = '\u{1}';
+
+pub fn join_fields(fields: &[String]) -> String {
+    fields.join(&FIELD_SEPARATOR.to_string())
+}
+
+/*
+index_key_for: the btree key a document has under an index, single or compound.
+
+None means the document is not indexed here: a missing field has no entry, and
+a compound index needs every part, since a partial key would sort among complete
+ones and collide with them.
+*/
+fn index_key_for(name: &str, doc: &Document) -> Option<Vec<u8>> {
+    if !name.contains(FIELD_SEPARATOR) {
+        return doc.get(name).map(serialize_key);
+    }
+    let fields: Vec<String> = name.split(FIELD_SEPARATOR).map(str::to_string).collect();
+    compound_key(&fields, doc)
+}
+
+// each part's serialized value, length-prefixed so "ab" + "c" cannot equal "a" + "bc"
+fn compound_key(fields: &[String], doc: &Document) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for field in fields {
+        let value = doc.get(field)?;
+        let bytes = serialize_key(value);
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Some(out)
 }

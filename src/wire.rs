@@ -60,6 +60,7 @@ pub const TAG_DOCUMENT: u8 = 0x07;
 // requests
 pub const OP_EXEC: u8 = 0x01;          // ASL text -> result
 pub const OP_INSERT: u8 = 0x02;        // collection + binary documents
+pub const OP_UPSERT: u8 = 0x05;       // collection + key field + key value + document
 pub const OP_PING: u8 = 0x03;
 pub const OP_CLOSE: u8 = 0x04;
 // responses

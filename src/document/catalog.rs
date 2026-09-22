@@ -30,7 +30,7 @@ use super::{Collection, CollectionError};
 
 use crate::storage::{BufferPool, DiskManager, HeapFile, Page, PageId, PAGE_SIZE};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -51,12 +51,16 @@ and if we outgrow one page later, we can make page 0 point to a catalog heap.
 const MAGIC_OFFSET: usize = 0;
 const COUNT_OFFSET: usize = 8;
 const ENTRIES_OFFSET: usize = 12;
+// the last bytes of every catalog page hold the id of the page continuing it, or zero
+const NEXT_POINTER_SIZE: usize = 8;
 
 #[derive(Debug)]
 pub enum CatalogError {
     Io(std::io::Error),
     InvalidCatalog,
     CatalogFull,
+    /// A value that a unique index already holds.
+    DuplicateKey(String, String),
     CollectionAlreadyExists(String),
     IndexAlreadyExists(String),
     IndexNotFound(String),
@@ -70,6 +74,9 @@ impl fmt::Display for CatalogError {
             CatalogError::Io(err) => write!(f, "catalog io error: {err}"),
             CatalogError::InvalidCatalog => write!(f, "invalid catalog page"),
             CatalogError::CatalogFull => write!(f, "catalog page is full"),
+            CatalogError::DuplicateKey(collection, field) => {
+                write!(f, "duplicate value for unique index {collection}.{field}")
+            }
             CatalogError::CollectionAlreadyExists(name) => write!(f, "collection already exists: {name}"),
             CatalogError::IndexAlreadyExists(name) => write!(f, "index already exists: {name}"),
             CatalogError::IndexNotFound(name) => write!(f, "index not found: {name}"),
@@ -99,6 +106,17 @@ pub struct Catalog {
     path: PathBuf,
     collections: HashMap<String, PageId>,
     pub(crate) indexes: HashMap<(String, String), PageId>,
+    /*
+    Which of those indexes reject a duplicate value on insert.
+
+    A separate set rather than a field on the entry, so the catalog page keeps
+    its existing layout and a database written before uniqueness existed still
+    decodes: an old page simply ends after the index section, and this comes
+    back empty.
+    */
+    pub(crate) unique_indexes: HashSet<(String, String)>,
+    // the pages after page 0 that the catalog spills onto, in order
+    overflow: Vec<PageId>,
 }
 
 impl Catalog {
@@ -114,7 +132,9 @@ impl Catalog {
         if disk.num_pages() == 0 {
             let page_id = disk.allocate_page()?;
             assert_eq!(page_id, CATALOG_PAGE_ID);
-            let page = encode_catalog_page(&HashMap::new(), &HashMap::new())?;
+            let bytes = encode_catalog(&HashMap::new(), &HashMap::new(), &HashSet::new())?;
+            let mut page = Page::new();
+            page.data[..bytes.len()].copy_from_slice(&bytes);
             disk.write_page(CATALOG_PAGE_ID, &page)?;
         }
         Self::open(path)
@@ -131,12 +151,14 @@ impl Catalog {
         if disk.num_pages() == 0 {
             return Err(CatalogError::InvalidCatalog);
         }
-        let page = disk.read_page(CATALOG_PAGE_ID)?;
-        let (collections, indexes) = decode_catalog_page(&page)?;
+        let (bytes, overflow) = read_catalog_chain(&mut disk)?;
+        let (collections, indexes, unique_indexes) = decode_catalog(&bytes)?;
         Ok(Catalog {
             path: path.to_path_buf(),
             collections,
             indexes,
+            unique_indexes,
+            overflow,
         })
     }
 
@@ -152,6 +174,21 @@ impl Catalog {
 
     pub fn has_index(&self, collection: &str, field: &str) -> bool {
         self.indexes.contains_key(&(collection.to_string(), field.to_string()))
+    }
+
+    pub fn is_unique_index(&self, collection: &str, field: &str) -> bool {
+        self.unique_indexes.contains(&(collection.to_string(), field.to_string()))
+    }
+
+    // every unique index on this collection, as field names
+    pub fn unique_index_fields(&self, collection: &str) -> Vec<String> {
+        let mut fields: Vec<String> = self.unique_indexes
+            .iter()
+            .filter(|(col, _)| col == collection)
+            .map(|(_, field)| field.clone())
+            .collect();
+        fields.sort();
+        fields
     }
 
     pub fn index_fields(&self, collection: &str) -> Vec<String> {
@@ -215,17 +252,91 @@ impl Catalog {
         self.flush()
     }
 
-    pub fn flush(&self) -> CatalogResult<()> {
+    /*
+    flush: write the catalog across as many pages as it needs.
+
+    Page 0 holds the first chunk, and the LAST eight bytes of every catalog page
+    hold the page id of the next chunk, or zero for none. Zero is safe as "none"
+    because page 0 is the catalog itself and can never be a continuation.
+
+    A catalog written before this existed occupies one page whose trailer is
+    zeros, so it reads back as a single chunk, unchanged.
+
+    Overflow pages are allocated once and kept in self.overflow, so repeated
+    flushes reuse them rather than leaking a page per write.
+    */
+    pub fn flush(&mut self) -> CatalogResult<()> {
+        let bytes = encode_catalog(&self.collections, &self.indexes, &self.unique_indexes)?;
         let mut disk = DiskManager::open(&self.path)?;
-        let page = encode_catalog_page(&self.collections, &self.indexes)?;
-        disk.write_page(CATALOG_PAGE_ID, &page)?;
+
+        let chunk_size = PAGE_SIZE - NEXT_POINTER_SIZE;
+        let chunks: Vec<&[u8]> = bytes.chunks(chunk_size).collect();
+        while self.overflow.len() < chunks.len().saturating_sub(1) {
+            let page_id = disk.allocate_page()?;
+            self.overflow.push(page_id);
+        }
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let page_id = if i == 0 { CATALOG_PAGE_ID } else { self.overflow[i - 1] };
+            let next = if i + 1 < chunks.len() { self.overflow[i] } else { 0 };
+
+            let mut page = Page::new();
+            page.data[..chunk.len()].copy_from_slice(chunk);
+            write_u64(&mut page.data, PAGE_SIZE - NEXT_POINTER_SIZE, next);
+            disk.write_page(page_id, &page)?;
+        }
         Ok(())
     }
 }
 
-fn encode_catalog_page(collections: &HashMap<String, PageId>,
-                       indexes: &HashMap<(String, String), PageId>) -> CatalogResult<Page> {
-    let mut page = Page::new();
+/*
+encode_catalog: the whole catalog as bytes, however long that is.
+
+It was one fixed page, and "too big" was CatalogFull. The bytes are now split
+across pages by flush(), so the only limit left is the file. The layout inside
+is unchanged, which is what keeps a single-page catalog written earlier
+readable.
+*/
+/*
+GrowBuf: a byte buffer that grows to fit whatever is written into it.
+
+The encoder addresses bytes by position, as it did when writing into a fixed
+page. This keeps that shape while removing the one-page limit: writing past the
+end extends the buffer instead of failing.
+*/
+struct GrowBuf {
+    data: Vec<u8>,
+}
+
+impl GrowBuf {
+    // sized up front from the entries it is about to hold, so writing by position is safe
+    fn sized(collections: &HashMap<String, PageId>,
+             indexes: &HashMap<(String, String), PageId>,
+             unique_indexes: &HashSet<(String, String)>) -> Self {
+        let mut size = ENTRIES_OFFSET;
+        for name in collections.keys() {
+            size += 2 + name.len() + 8;
+        }
+        size += 4;
+        for (collection, field) in indexes.keys() {
+            size += 2 + collection.len() + 2 + field.len() + 8;
+        }
+        size += 4;
+        for (collection, field) in unique_indexes {
+            size += 2 + collection.len() + 2 + field.len();
+        }
+        GrowBuf { data: vec![0u8; size] }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.data
+    }
+}
+
+fn encode_catalog(collections: &HashMap<String, PageId>,
+                  indexes: &HashMap<(String, String), PageId>,
+                  unique_indexes: &HashSet<(String, String)>) -> CatalogResult<Vec<u8>> {
+    let mut page = GrowBuf::sized(collections, indexes, unique_indexes);
     page.data[MAGIC_OFFSET..MAGIC_OFFSET + CATALOG_MAGIC.len()].copy_from_slice(CATALOG_MAGIC);
     write_u32(&mut page.data, COUNT_OFFSET, collections.len() as u32);
 
@@ -235,14 +346,6 @@ fn encode_catalog_page(collections: &HashMap<String, PageId>,
     let mut pos = ENTRIES_OFFSET;
     for (name, root) in entries {
         let name_bytes = name.as_bytes();
-        if name_bytes.len() > u16::MAX as usize {
-            return Err(CatalogError::CatalogFull);
-        }
-        let entry_len = 2 + name_bytes.len() + 8;
-        if pos + entry_len > PAGE_SIZE {
-            return Err(CatalogError::CatalogFull);
-        }
-
         write_u16(&mut page.data, pos, name_bytes.len() as u16);
         pos += 2;
         page.data[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
@@ -256,14 +359,6 @@ fn encode_catalog_page(collections: &HashMap<String, PageId>,
     for ((collection, field), root) in indexes {
         let collection_bytes = collection.as_bytes();
         let field_bytes = field.as_bytes();
-        if collection_bytes.len() > u16::MAX as usize || field_bytes.len() > u16::MAX as usize {
-            return Err(CatalogError::CatalogFull);
-        }
-        let entry_len = 2 + collection_bytes.len() + 2 + field_bytes.len() + 8;
-        if pos + entry_len > PAGE_SIZE {
-            return Err(CatalogError::CatalogFull);
-        }
-
         // write collection name len + bytes
         write_u16(&mut page.data, pos, collection_bytes.len() as u16);
         pos += 2;
@@ -281,12 +376,73 @@ fn encode_catalog_page(collections: &HashMap<String, PageId>,
         pos += 8;
     }
 
-    Ok(page)
+
+    /*
+    The unique section. Written last so a decoder that predates it stops after
+    the indexes and simply never reads these bytes.
+    */
+    write_u32(&mut page.data, pos, unique_indexes.len() as u32);
+    pos += 4;
+
+    let mut unique: Vec<&(String, String)> = unique_indexes.iter().collect();
+    unique.sort();
+    for (collection, field) in unique {
+        let collection_bytes = collection.as_bytes();
+        let field_bytes = field.as_bytes();
+        write_u16(&mut page.data, pos, collection_bytes.len() as u16);
+        pos += 2;
+        page.data[pos..pos + collection_bytes.len()].copy_from_slice(collection_bytes);
+        pos += collection_bytes.len();
+
+        write_u16(&mut page.data, pos, field_bytes.len() as u16);
+        pos += 2;
+        page.data[pos..pos + field_bytes.len()].copy_from_slice(field_bytes);
+        pos += field_bytes.len();
+    }
+
+    Ok(page.into_bytes())
 }
 
-fn decode_catalog_page(page: &Page)
-    -> CatalogResult<(HashMap<String, PageId>, HashMap<(String, String), PageId>)> {
-    if &page.data[MAGIC_OFFSET..MAGIC_OFFSET + CATALOG_MAGIC.len()] != CATALOG_MAGIC {
+type DecodedCatalog = (
+    HashMap<String, PageId>,
+    HashMap<(String, String), PageId>,
+    HashSet<(String, String)>,
+);
+
+/*
+read_catalog_chain: page 0 and every page it points at, joined back into one
+buffer, plus the ids of those continuation pages so flush can reuse them.
+*/
+fn read_catalog_chain(disk: &mut DiskManager) -> CatalogResult<(Vec<u8>, Vec<PageId>)> {
+    let mut bytes = Vec::new();
+    let mut overflow = Vec::new();
+    let mut page_id = CATALOG_PAGE_ID;
+
+    loop {
+        let page = disk.read_page(page_id)?;
+        bytes.extend_from_slice(&page.data[..PAGE_SIZE - NEXT_POINTER_SIZE]);
+        let next = read_u64(&page.data, PAGE_SIZE - NEXT_POINTER_SIZE);
+        if next == 0 {
+            break;
+        }
+        if next >= disk.num_pages() || overflow.contains(&next) {
+            return Err(CatalogError::InvalidCatalog);
+        }
+        overflow.push(next);
+        page_id = next;
+    }
+    Ok((bytes, overflow))
+}
+
+struct CatalogBytes<'a> {
+    data: &'a [u8],
+}
+
+fn decode_catalog(bytes: &[u8]) -> CatalogResult<DecodedCatalog> {
+    let page = CatalogBytes { data: bytes };
+    if page.data.len() < ENTRIES_OFFSET
+        || &page.data[MAGIC_OFFSET..MAGIC_OFFSET + CATALOG_MAGIC.len()] != CATALOG_MAGIC
+    {
         return Err(CatalogError::InvalidCatalog);
     }
 
@@ -295,11 +451,11 @@ fn decode_catalog_page(page: &Page)
     let mut collections = HashMap::with_capacity(count);
 
     for _ in 0..count {
-        if pos + 2 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + 2 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let name_len = read_u16(&page.data, pos) as usize;
         pos += 2;
 
-        if pos + name_len + 8 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + name_len + 8 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let name = std::str::from_utf8(&page.data[pos..pos + name_len])
             .map_err(|_| CatalogError::InvalidCatalog)?
             .to_string();
@@ -311,37 +467,68 @@ fn decode_catalog_page(page: &Page)
     }
 
     //read indexes
-    if pos + 4 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+    if pos + 4 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
     let count = read_u32(&page.data, pos) as usize;
     let mut indexes = HashMap::with_capacity(count);
     pos += 4;
 
     for _ in 0..count {
         // read collection name len + bytes
-        if pos + 2 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + 2 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let name_len = read_u16(&page.data, pos) as usize;
         pos += 2;
-        if pos + name_len > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + name_len > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let name: String = read_string(&page.data, pos, name_len)?;
         pos += name_len;
 
         // read field name len + bytes
-        if pos + 2 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + 2 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let field_len = read_u16(&page.data, pos) as usize;
         pos += 2;
-        if pos + field_len > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + field_len > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let field: String = read_string(&page.data, pos, field_len)?;
         pos += field_len;
 
         // read root u64
-        if pos + 8 > PAGE_SIZE { return Err(CatalogError::InvalidCatalog); }
+        if pos + 8 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
         let root: PageId = read_u64(&page.data, pos);
         pos += 8;
 
         //insert the entry
         indexes.insert((name, field), root);
     }
-    Ok((collections, indexes))
+
+    /*
+    The unique section, written after the indexes.
+
+    A page from before uniqueness existed has nothing here, and its trailing
+    bytes are zeros, so a count of zero and "no room left" both mean the same
+    thing: no unique indexes. That is what keeps old database files readable.
+    */
+    let mut unique_indexes = HashSet::new();
+    if pos + 4 <= page.data.len() {
+        let count = read_u32(&page.data, pos) as usize;
+        pos += 4;
+        for _ in 0..count {
+            if pos + 2 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
+            let name_len = read_u16(&page.data, pos) as usize;
+            pos += 2;
+            if pos + name_len > page.data.len() { return Err(CatalogError::InvalidCatalog); }
+            let name: String = read_string(&page.data, pos, name_len)?;
+            pos += name_len;
+
+            if pos + 2 > page.data.len() { return Err(CatalogError::InvalidCatalog); }
+            let field_len = read_u16(&page.data, pos) as usize;
+            pos += 2;
+            if pos + field_len > page.data.len() { return Err(CatalogError::InvalidCatalog); }
+            let field: String = read_string(&page.data, pos, field_len)?;
+            pos += field_len;
+
+            unique_indexes.insert((name, field));
+        }
+    }
+
+    Ok((collections, indexes, unique_indexes))
 }
 
 fn read_u64(buf: &[u8], offset: usize) -> u64 {
@@ -467,30 +654,36 @@ mod tests {
 
     #[test]
     fn test_decode_catalog_rejects_bad_index_utf8() {
-        let mut page = encode_catalog_page(&HashMap::new(), &HashMap::new()).unwrap();
+        let mut bytes = encode_catalog(&HashMap::new(), &HashMap::new(), &HashSet::new()).unwrap();
+        bytes.resize(PAGE_SIZE, 0);
         let pos = ENTRIES_OFFSET + 4;
 
-        write_u32(&mut page.data, ENTRIES_OFFSET, 1);
-        write_u16(&mut page.data, pos, 1);
-        page.data[pos + 2] = 0xff;
-        write_u16(&mut page.data, pos + 3, 1);
-        page.data[pos + 5] = b'x';
-        write_u64(&mut page.data, pos + 6, 12);
+        write_u32(&mut bytes, ENTRIES_OFFSET, 1);
+        write_u16(&mut bytes, pos, 1);
+        bytes[pos + 2] = 0xff;
+        write_u16(&mut bytes, pos + 3, 1);
+        bytes[pos + 5] = b'x';
+        write_u64(&mut bytes, pos + 6, 12);
 
-        assert!(matches!(decode_catalog_page(&page), Err(CatalogError::InvalidCatalog)));
+        assert!(matches!(decode_catalog(&bytes), Err(CatalogError::InvalidCatalog)));
     }
 
+    /*
+    A catalog larger than one page used to be CatalogFull. It now spans pages,
+    so the test is that it survives the round trip rather than that it fails.
+    */
     #[test]
-    fn test_encode_catalog_rejects_oversized_index_section() {
+    fn test_catalog_larger_than_a_page_round_trips() {
         let mut indexes = HashMap::new();
         for i in 0..400 {
             indexes.insert((format!("collection-{i}"), format!("field-{i}")), i as PageId);
         }
 
-        assert!(matches!(
-            encode_catalog_page(&HashMap::new(), &indexes),
-            Err(CatalogError::CatalogFull)
-        ));
+        let bytes = encode_catalog(&HashMap::new(), &indexes, &HashSet::new()).unwrap();
+        assert!(bytes.len() > PAGE_SIZE, "this catalog is meant to need more than one page");
+
+        let (_, decoded, _) = decode_catalog(&bytes).unwrap();
+        assert_eq!(decoded, indexes);
     }
 
     fn user_doc(id: i64, name: &str) -> Document {

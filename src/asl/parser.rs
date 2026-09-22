@@ -240,17 +240,58 @@ impl<'a> Parser<'a> {
     fn parse_create(&mut self) -> Result<Statement, ParseError> {
         self.expect(Token::Create)?;
         // create index ...   or   create <coll> { schema }
+        // create [unique] index [if not exists] on <coll>.<field>
+        let unique = if self.peek_token() == Some(&Token::Unique) {
+            self.advance();
+            true
+        } else {
+            false
+        };
         if self.peek_token() == Some(&Token::Index) {
             self.advance();
+            let if_not_exists = self.parse_if_not_exists()?;
             self.expect(Token::On)?;
             let (collection, fields) = self.parse_index_target()?;
-            return Ok(Statement::CreateIndex { collection, fields });
+            return Ok(Statement::CreateIndex { collection, fields, if_not_exists, unique });
         }
+        if unique {
+            return Err(self.error_here("expected 'index' after 'unique'"));
+        }
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.expect_ident()?;
         self.expect(Token::LBrace)?;
         let schema = self.parse_schema_field_list()?;
         self.expect(Token::RBrace)?;
-        Ok(Statement::CreateCollection { name, schema })
+        Ok(Statement::CreateCollection { name, schema, if_not_exists })
+    }
+
+    /*
+    parse_if_not_exists / parse_if_exists: the optional guard that turns a DDL
+    statement into a no-op instead of an error when the object is already in the
+    state asked for.
+
+    They exist because startup DDL is run on every boot: a client that creates its
+    collections each time would otherwise have to send statements it expects to
+    fail, and then tell a benign "already exists" apart from a real failure by
+    reading the message.
+    */
+    fn parse_if_not_exists(&mut self) -> Result<bool, ParseError> {
+        if self.peek_token() != Some(&Token::If) {
+            return Ok(false);
+        }
+        self.advance();
+        self.expect(Token::Not)?;
+        self.expect(Token::Exists)?;
+        Ok(true)
+    }
+
+    fn parse_if_exists(&mut self) -> Result<bool, ParseError> {
+        if self.peek_token() != Some(&Token::If) {
+            return Ok(false);
+        }
+        self.advance();
+        self.expect(Token::Exists)?;
+        Ok(true)
     }
 
     fn parse_drop_statement(&mut self) -> Result<Statement, ParseError> {
@@ -262,14 +303,16 @@ impl<'a> Parser<'a> {
         match peeked {
             Some(Token::Index) => {
                 self.advance();
+                let if_exists = self.parse_if_exists()?;
                 self.expect(Token::On)?;
                 let (collection, fields) = self.parse_index_target()?;
-                Ok(Statement::DropIndex { collection, fields })
+                Ok(Statement::DropIndex { collection, fields, if_exists })
             }
             Some(Token::Ident(s)) if s == "collection" => {
                 self.advance();
+                let if_exists = self.parse_if_exists()?;
                 let name = self.expect_ident()?;
-                Ok(Statement::DropCollection { name })
+                Ok(Statement::DropCollection { name, if_exists })
             }
             Some(other) => Err(self.error_here(format!(
                 "expected 'collection' or 'index' after 'drop', found {:?}", other
@@ -438,6 +481,7 @@ impl<'a> Parser<'a> {
                 | Some(Token::Join)
                 | Some(Token::Insert)
                 | Some(Token::Update)
+                | Some(Token::Upsert)
                 | Some(Token::Delete)
         )
     }
@@ -470,6 +514,7 @@ impl<'a> Parser<'a> {
                 | Some(Token::Join)
                 | Some(Token::Insert)
                 | Some(Token::Update)
+                | Some(Token::Upsert)
                 | Some(Token::Delete)
         )
     }
@@ -500,6 +545,7 @@ impl<'a> Parser<'a> {
             Some(Token::Join) => self.parse_join_stage(),
             Some(Token::Insert) => self.parse_insert_stage(),
             Some(Token::Update) => self.parse_update_stage(),
+            Some(Token::Upsert) => self.parse_upsert_stage(),
             Some(Token::Delete) => { self.advance(); Ok(Stage::Delete) }
             Some(other) => Err(self.error_here(format!("expected a stage name, found {:?}", other))),
             None => Err(self.error_here("expected a stage name, found end of input")),
@@ -653,6 +699,21 @@ impl<'a> Parser<'a> {
         self.expect(Token::EqEq)?;
         let right_field = self.expect_ident()?;
         Ok(Stage::Join { collection, left_field, right_field })
+    }
+
+    /*
+    upsert: update every matched row with this document's fields, or insert it
+    when the pipeline matched nothing.
+
+        from nodes | where nodeId == "n1" | upsert { nodeId: "n1", load: 3 }
+
+    One statement rather than the client's update-then-insert-if-zero, which
+    cannot be made atomic from outside and races another writer.
+    */
+    fn parse_upsert_stage(&mut self) -> Result<Stage, ParseError> {
+        self.expect(Token::Upsert)?;
+        let doc = self.parse_doc_literal()?;
+        Ok(Stage::Upsert { doc })
     }
 
     fn parse_insert_stage(&mut self) -> Result<Stage, ParseError> {
@@ -1560,7 +1621,8 @@ mod tests {
                     SchemaField { name: "id".into(), ty: SchemaType::Int, required: true, unique: true },
                     SchemaField { name: "name".into(), ty: SchemaType::String, required: true, unique: false },
                     SchemaField { name: "age".into(), ty: SchemaType::Int, required: false, unique: false },
-                ]
+                ],
+                if_not_exists: false,
             }
         );
     }
@@ -1579,7 +1641,7 @@ mod tests {
     #[test]
     fn drop_collection_stmt() {
         let stmt = parse_str("drop collection users");
-        assert_eq!(stmt, Statement::DropCollection { name: "users".into() });
+        assert_eq!(stmt, Statement::DropCollection { name: "users".into(), if_exists: false });
     }
 
     #[test]
@@ -1587,7 +1649,53 @@ mod tests {
         let stmt = parse_str("create index on users.id");
         assert_eq!(
             stmt,
-            Statement::CreateIndex { collection: "users".into(), fields: vec!["id".into()] }
+            Statement::CreateIndex { collection: "users".into(), fields: vec!["id".into()], if_not_exists: false, unique: false }
+        );
+    }
+
+    #[test]
+    fn create_collection_if_not_exists() {
+        let stmt = parse_str("create if not exists users { }");
+        assert_eq!(
+            stmt,
+            Statement::CreateCollection {
+                name: "users".into(),
+                schema: vec![],
+                if_not_exists: true,
+            }
+        );
+    }
+
+    #[test]
+    fn create_index_if_not_exists() {
+        let stmt = parse_str("create index if not exists on users.age");
+        assert_eq!(
+            stmt,
+            Statement::CreateIndex {
+                collection: "users".into(),
+                fields: vec!["age".into()],
+                if_not_exists: true,
+                unique: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_collection_if_exists() {
+        let stmt = parse_str("drop collection if exists users");
+        assert_eq!(stmt, Statement::DropCollection { name: "users".into(), if_exists: true });
+    }
+
+    #[test]
+    fn drop_index_if_exists() {
+        let stmt = parse_str("drop index if exists on users.age");
+        assert_eq!(
+            stmt,
+            Statement::DropIndex {
+                collection: "users".into(),
+                fields: vec!["age".into()],
+                if_exists: true,
+            }
         );
     }
 
@@ -1599,6 +1707,8 @@ mod tests {
             Statement::CreateIndex {
                 collection: "orders".into(),
                 fields: vec!["user_id".into(), "status".into()],
+                if_not_exists: false,
+                unique: false,
             }
         );
     }
@@ -1614,7 +1724,7 @@ mod tests {
         let stmt = parse_str("drop index on users.id");
         assert_eq!(
             stmt,
-            Statement::DropIndex { collection: "users".into(), fields: vec!["id".into()] }
+            Statement::DropIndex { collection: "users".into(), fields: vec!["id".into()], if_exists: false }
         );
     }
 

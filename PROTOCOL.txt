@@ -94,12 +94,21 @@ OPCODES
     0x02  INSERT   binary documents     0x82  DOCUMENTS  u32 count + documents
     0x03  PING                          0x83  ERROR      u32 len + UTF-8
     0x04  CLOSE                         0x84  PONG
+    0x05  UPSERT   binary keyed write
 
 The high bit marks a response, so a frame's direction is readable from one byte
 while debugging a hex dump.
 
     EXEC    [u32 len][ASL text]
     INSERT  [u32 len][collection][u32 count][document bodies]
+    UPSERT  [u32 len][collection][u32 key_field][key_field][value][document body]
+
+UPSERT addresses one document through an existing single-field index. If the
+key is absent, it inserts the document. If present, it merges the supplied
+fields into that document, retaining fields the payload did not mention. It
+returns AFFECTED 1 in either case. Its unique-index constraints are checked
+before the old document is deleted, so a conflicting update leaves the stored
+document intact.
 
 VALUES: one tag byte, then the payload.
 

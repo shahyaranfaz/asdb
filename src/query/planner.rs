@@ -403,6 +403,11 @@ fn plan_stage(input: PhysicalOp, stage: &Stage) -> QueryResult<PhysicalOp> {
             collection,
             assignments: assignments.clone(),
         },
+        Stage::Upsert { doc } => PhysicalOp::Upsert {
+            input,
+            collection,
+            doc: doc.clone(),
+        },
         Stage::Delete => PhysicalOp::Delete { input, collection },
 
         Stage::From { .. } => {

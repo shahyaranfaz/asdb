@@ -606,3 +606,350 @@ fn test_ttl_shaped_delete_agrees_with_and_without_an_index() {
     assert_eq!(left_a, left_b, "index changed which rows expired");
     assert!(left_a.contains(&999), "the untimestamped document must never expire");
 }
+
+/*
+upsert: one statement that writes whether or not the document is already there.
+
+Both directions matter, and they are the two a client cannot make atomic from
+outside: an update that matched nothing has to become an insert, and an update
+that matched must not duplicate the row.
+*/
+#[test]
+fn upsert_inserts_when_nothing_matches() {
+    let tmp = TempDb::new("upsert_insert");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+
+    let written = affected(run(&mut db, r#"from nodes | where nodeId == "n1" | upsert { nodeId: "n1", load: 3 }"#));
+
+    assert_eq!(written, 1);
+    let rows = db.scan_collection("nodes").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(text(&rows[0].1, "nodeId"), "n1");
+    assert_eq!(int(&rows[0].1, "load"), 3);
+}
+
+#[test]
+fn upsert_updates_in_place_and_keeps_untouched_fields() {
+    let tmp = TempDb::new("upsert_update");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+
+    let mut existing = Document::new();
+    existing.insert("nodeId".to_string(), Value::String("n1".to_string()));
+    existing.insert("load".to_string(), Value::Int(1));
+    existing.insert("hostname".to_string(), Value::String("mac".to_string()));
+    db.insert_doc("nodes", &existing).unwrap();
+
+    let written = affected(run(&mut db, r#"from nodes | where nodeId == "n1" | upsert { nodeId: "n1", load: 9 }"#));
+
+    assert_eq!(written, 1);
+    let rows = db.scan_collection("nodes").unwrap();
+    assert_eq!(rows.len(), 1, "upsert must not leave a second copy behind");
+    assert_eq!(int(&rows[0].1, "load"), 9);
+    assert_eq!(text(&rows[0].1, "hostname"), "mac", "a field the document did not mention is kept");
+}
+
+#[test]
+fn upsert_writes_every_matching_row() {
+    let tmp = TempDb::new("upsert_many");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+
+    for id in ["n1", "n2"] {
+        let mut doc = Document::new();
+        doc.insert("nodeId".to_string(), Value::String(id.to_string()));
+        doc.insert("status".to_string(), Value::String("UP".to_string()));
+        db.insert_doc("nodes", &doc).unwrap();
+    }
+
+    let written = affected(run(&mut db, r#"from nodes | where status == "UP" | upsert { status: "DOWN" }"#));
+
+    assert_eq!(written, 2);
+    let rows = db.scan_collection("nodes").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(_, d)| text(d, "status") == "DOWN"));
+}
+
+/*
+unique indexes: the constraint the catalog only parsed before.
+
+The case that matters is the one a client cannot do for itself: two writers
+both check, both see nothing, and both insert. A constraint inside the insert
+has no gap to race.
+*/
+#[test]
+fn unique_index_refuses_a_duplicate_insert() {
+    let tmp = TempDb::new("unique_insert");
+    let mut db = tmp.open();
+    db.create_collection("versions").unwrap();
+    db.create_index_with("versions", "key", true).unwrap();
+
+    let mut first = Document::new();
+    first.insert("key".to_string(), Value::String("p1:spawns:1".to_string()));
+    db.insert_doc("versions", &first).unwrap();
+
+    let mut second = Document::new();
+    second.insert("key".to_string(), Value::String("p1:spawns:1".to_string()));
+    let err = db.insert_doc("versions", &second);
+
+    assert!(err.is_err(), "the second insert of the same key must be refused");
+    assert_eq!(db.scan_collection("versions").unwrap().len(), 1, "nothing may be written by a refused insert");
+}
+
+#[test]
+fn unique_index_allows_different_values_and_missing_fields() {
+    let tmp = TempDb::new("unique_ok");
+    let mut db = tmp.open();
+    db.create_collection("versions").unwrap();
+    db.create_index_with("versions", "key", true).unwrap();
+
+    for key in ["a", "b"] {
+        let mut doc = Document::new();
+        doc.insert("key".to_string(), Value::String(key.to_string()));
+        db.insert_doc("versions", &doc).unwrap();
+    }
+
+    // a document without the field has no index entry, so there is nothing to collide with
+    let mut keyless = Document::new();
+    keyless.insert("other".to_string(), Value::Int(1));
+    db.insert_doc("versions", &keyless).unwrap();
+
+    assert_eq!(db.scan_collection("versions").unwrap().len(), 3);
+}
+
+#[test]
+fn unique_index_is_refused_over_existing_duplicates() {
+    let tmp = TempDb::new("unique_existing");
+    let mut db = tmp.open();
+    db.create_collection("versions").unwrap();
+
+    for _ in 0..2 {
+        let mut doc = Document::new();
+        doc.insert("key".to_string(), Value::String("same".to_string()));
+        db.insert_doc("versions", &doc).unwrap();
+    }
+
+    assert!(db.create_index_with("versions", "key", true).is_err());
+}
+
+#[test]
+fn unique_survives_reopening_the_database() {
+    let tmp = TempDb::new("unique_reopen");
+    {
+        let mut db = tmp.open();
+        db.create_collection("versions").unwrap();
+        db.create_index_with("versions", "key", true).unwrap();
+        let mut doc = Document::new();
+        doc.insert("key".to_string(), Value::String("a".to_string()));
+        db.insert_doc("versions", &doc).unwrap();
+    }
+
+    let mut db = tmp.open();
+    let mut duplicate = Document::new();
+    duplicate.insert("key".to_string(), Value::String("a".to_string()));
+
+    assert!(db.insert_doc("versions", &duplicate).is_err(), "uniqueness must be persisted, not in-memory only");
+}
+
+/*
+compound unique: the constraint AS-CORE actually wants, which is over a
+combination rather than one field. Same version number is fine in another
+namespace; the same triple twice is not.
+*/
+#[test]
+fn compound_unique_index_constrains_the_combination() {
+    let tmp = TempDb::new("unique_compound");
+    let mut db = tmp.open();
+    db.create_collection("config_versions").unwrap();
+    let fields = vec!["placeId".to_string(), "namespace".to_string(), "version".to_string()];
+    db.create_index_on("config_versions", &fields, true).unwrap();
+
+    let version = |place: &str, ns: &str, v: i64| {
+        let mut doc = Document::new();
+        doc.insert("placeId".to_string(), Value::String(place.to_string()));
+        doc.insert("namespace".to_string(), Value::String(ns.to_string()));
+        doc.insert("version".to_string(), Value::Int(v));
+        doc
+    };
+
+    db.insert_doc("config_versions", &version("p1", "spawns", 1)).unwrap();
+    db.insert_doc("config_versions", &version("p1", "weapons", 1)).unwrap();
+    db.insert_doc("config_versions", &version("p2", "spawns", 1)).unwrap();
+    db.insert_doc("config_versions", &version("p1", "spawns", 2)).unwrap();
+
+    assert!(
+        db.insert_doc("config_versions", &version("p1", "spawns", 1)).is_err(),
+        "the same place, namespace and version twice must be refused"
+    );
+    assert_eq!(db.scan_collection("config_versions").unwrap().len(), 4);
+}
+
+#[test]
+fn compound_key_parts_cannot_run_together() {
+    let tmp = TempDb::new("unique_compound_split");
+    let mut db = tmp.open();
+    db.create_collection("pairs").unwrap();
+    db.create_index_on("pairs", &vec!["a".to_string(), "b".to_string()], true).unwrap();
+
+    let pair = |a: &str, b: &str| {
+        let mut doc = Document::new();
+        doc.insert("a".to_string(), Value::String(a.to_string()));
+        doc.insert("b".to_string(), Value::String(b.to_string()));
+        doc
+    };
+
+    // "ab" + "c" and "a" + "bc" are different keys, and would not be without length prefixes
+    db.insert_doc("pairs", &pair("ab", "c")).unwrap();
+    db.insert_doc("pairs", &pair("a", "bc")).unwrap();
+
+    assert_eq!(db.scan_collection("pairs").unwrap().len(), 2);
+}
+
+/*
+More collections than fit on one catalog page.
+
+This is the failure that took out a dev database: every collection and index
+entry had to fit in page 0, and past that everything failed at setup with
+CatalogFull. The catalog now spills onto further pages, so the only limit is
+the file.
+*/
+#[test]
+fn catalog_spans_pages_and_survives_reopening() {
+    let tmp = TempDb::new("catalog_many");
+    {
+        let mut db = tmp.open();
+        for i in 0..300 {
+            db.create_collection(&format!("collection_number_{i:04}")).unwrap();
+        }
+    }
+
+    let mut db = tmp.open();
+    for i in 0..300 {
+        assert!(db.has_collection(&format!("collection_number_{i:04}")), "collection {i} was lost");
+    }
+
+    // and it still works as a database, not just as a name list
+    let mut doc = Document::new();
+    doc.insert("n".to_string(), Value::Int(7));
+    db.insert_doc("collection_number_0299", &doc).unwrap();
+    assert_eq!(db.scan_collection("collection_number_0299").unwrap().len(), 1);
+}
+
+#[test]
+fn repeated_catalog_flushes_reuse_their_overflow_pages() {
+    let tmp = TempDb::new("catalog_reflush");
+    let mut db = tmp.open();
+
+    // enough entries to need more than one catalog page
+    for i in 0..200 {
+        db.create_collection(&format!("c{i:04}")).unwrap();
+    }
+    let after_creates = std::fs::metadata(&tmp.path).unwrap().len();
+
+    /*
+    Dropping rewrites the catalog without allocating anything else, so the file
+    must not grow. Creating would also allocate a heap root per collection,
+    which drop does not reclaim yet, and that would measure a different thing.
+    */
+    for i in 0..50 {
+        db.drop_collection(&format!("c{i:04}")).unwrap();
+    }
+
+    let after_drops = std::fs::metadata(&tmp.path).unwrap().len();
+    assert_eq!(after_creates, after_drops, "a flush must reuse its overflow pages, not allocate new ones");
+}
+
+/*
+upsert_by: the keyed write behind OP_UPSERT.
+
+Same two directions as the ASL stage, plus the case the protocol promises: a
+write that would break a unique index leaves the stored document alone. That
+one is worth a test because the update is a delete followed by an insert, and
+checking after the delete would destroy the document it refused to replace.
+*/
+#[test]
+fn upsert_by_inserts_then_updates_in_place() {
+    let tmp = TempDb::new("upsert_by");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+    db.create_index("nodes", "nodeId").unwrap();
+
+    let mut first = Document::new();
+    first.insert("nodeId".to_string(), Value::String("n1".to_string()));
+    first.insert("load".to_string(), Value::Int(1));
+    first.insert("hostname".to_string(), Value::String("mac".to_string()));
+    let key = Value::String("n1".to_string());
+
+    assert_eq!(db.upsert_by("nodes", "nodeId", &key, &first).unwrap(), 1);
+
+    let mut second = Document::new();
+    second.insert("nodeId".to_string(), Value::String("n1".to_string()));
+    second.insert("load".to_string(), Value::Int(9));
+    assert_eq!(db.upsert_by("nodes", "nodeId", &key, &second).unwrap(), 1);
+
+    let rows = db.scan_collection("nodes").unwrap();
+    assert_eq!(rows.len(), 1, "the second write must replace, not duplicate");
+    assert_eq!(int(&rows[0].1, "load"), 9);
+    assert_eq!(text(&rows[0].1, "hostname"), "mac", "a field the write did not mention is kept");
+}
+
+#[test]
+fn upsert_by_refusing_a_unique_conflict_keeps_the_stored_document() {
+    let tmp = TempDb::new("upsert_by_conflict");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+    db.create_index("nodes", "nodeId").unwrap();
+    db.create_index_with("nodes", "hostname", true).unwrap();
+
+    for (id, host) in [("n1", "mac"), ("n2", "pc")] {
+        let mut doc = Document::new();
+        doc.insert("nodeId".to_string(), Value::String(id.to_string()));
+        doc.insert("hostname".to_string(), Value::String(host.to_string()));
+        db.insert_doc("nodes", &doc).unwrap();
+    }
+
+    // n1 tries to take n2's hostname, which the unique index already holds
+    let mut clash = Document::new();
+    clash.insert("hostname".to_string(), Value::String("pc".to_string()));
+    let result = db.upsert_by("nodes", "nodeId", &Value::String("n1".to_string()), &clash);
+
+    assert!(result.is_err(), "the conflicting write must be refused");
+    let rows = db.scan_collection("nodes").unwrap();
+    assert_eq!(rows.len(), 2, "the refused write must not have deleted anything");
+    let n1 = rows.iter().find(|(_, d)| text(d, "nodeId") == "n1").expect("n1 is still there");
+    assert_eq!(text(&n1.1, "hostname"), "mac", "n1 keeps the hostname it had");
+}
+
+#[test]
+fn upsert_by_keeping_its_own_key_is_not_a_conflict() {
+    let tmp = TempDb::new("upsert_by_self");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+    db.create_index_with("nodes", "nodeId", true).unwrap();
+
+    let mut doc = Document::new();
+    doc.insert("nodeId".to_string(), Value::String("n1".to_string()));
+    doc.insert("load".to_string(), Value::Int(1));
+    db.insert_doc("nodes", &doc).unwrap();
+
+    // writing the same id back must not collide with the document being written
+    doc.insert("load".to_string(), Value::Int(2));
+    assert!(db.upsert_by("nodes", "nodeId", &Value::String("n1".to_string()), &doc).is_ok());
+    assert_eq!(int(&db.scan_collection("nodes").unwrap()[0].1, "load"), 2);
+}
+
+#[test]
+fn upsert_by_needs_an_index_on_the_key() {
+    let tmp = TempDb::new("upsert_by_unindexed");
+    let mut db = tmp.open();
+    db.create_collection("nodes").unwrap();
+
+    let mut doc = Document::new();
+    doc.insert("nodeId".to_string(), Value::String("n1".to_string()));
+
+    assert!(
+        db.upsert_by("nodes", "nodeId", &Value::String("n1".to_string()), &doc).is_err(),
+        "an unindexed key is an error rather than a silent scan"
+    );
+}
