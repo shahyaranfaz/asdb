@@ -57,17 +57,58 @@ pub const TAG_STRING: u8 = 0x05;
 pub const TAG_ARRAY: u8 = 0x06;
 pub const TAG_DOCUMENT: u8 = 0x07;
 
-// requests
-pub const OP_EXEC: u8 = 0x01;          // ASL text -> result
-pub const OP_INSERT: u8 = 0x02;        // collection + binary documents
-pub const OP_UPSERT: u8 = 0x05;       // collection + key field + key value + document
-pub const OP_PING: u8 = 0x03;
-pub const OP_CLOSE: u8 = 0x04;
-// responses
-pub const OP_AFFECTED: u8 = 0x81;      // u64
-pub const OP_DOCUMENTS: u8 = 0x82;     // u32 count + documents
-pub const OP_ERROR: u8 = 0x83;         // u32 len + UTF-8
-pub const OP_PONG: u8 = 0x84;
+/*
+Op: the opcodes, as a type rather than as loose bytes.
+
+A frame's first byte is the only place the number matters, so it is parsed on
+read and written back on send; nothing in between carries a bare u8. The Java
+client mirrors this as AbpCodec.Op, and the numbers are the contract between
+the two.
+
+An unknown opcode is a real case, not a bug: a mismatched build on either side,
+or a desynchronised stream. TryFrom gives the caller that case to answer rather
+than a number nothing matches.
+*/
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Op {
+    // requests
+    Exec = 1,
+    Insert = 2,
+    Ping = 3,
+    Close = 4,
+    Upsert = 5,
+    // responses
+    Affected = 6,
+    Documents = 7,
+    Error = 8,
+    Pong = 9,
+}
+
+impl Op {
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+impl TryFrom<u8> for Op {
+    type Error = u8;
+
+    fn try_from(code: u8) -> Result<Self, u8> {
+        Ok(match code {
+            1 => Op::Exec,
+            2 => Op::Insert,
+            3 => Op::Ping,
+            4 => Op::Close,
+            5 => Op::Upsert,
+            6 => Op::Affected,
+            7 => Op::Documents,
+            8 => Op::Error,
+            9 => Op::Pong,
+            other => return Err(other),
+        })
+    }
+}
 
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 

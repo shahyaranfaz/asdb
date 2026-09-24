@@ -113,8 +113,19 @@ fn handle(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result<()> {
         frame.resize(len, 0);
         reader.read_exact(&mut frame)?;
 
-        let opcode = frame[0];
-        if opcode == OP_CLOSE {
+        /*
+        The byte becomes an Op here and stays one. An unrecognised code is
+        answered rather than dropped, so a mismatched client gets told why.
+        */
+        let opcode = match Op::try_from(frame[0]) {
+            Ok(op) => op,
+            Err(code) => {
+                reply_error(&mut writer, &format!("unknown opcode {code}"))?;
+                writer.flush()?;
+                continue;
+            }
+        };
+        if opcode == Op::Close {
             return Ok(());
         }
         dispatch(opcode, &frame[1..], &db, &mut writer)?;
@@ -123,31 +134,40 @@ fn handle(stream: TcpStream, db: Arc<Mutex<Database>>) -> std::io::Result<()> {
 }
 
 fn dispatch(
-    opcode: u8,
+    opcode: Op,
     payload: &[u8],
     db: &Arc<Mutex<Database>>,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
+    /*
+    Exhaustive over Op, with no catch-all: adding an opcode breaks this match
+    until it is handled here, which is the point of the enum.
+    */
     match opcode {
-        OP_PING => {
+        Op::Ping => {
             let mut f = Vec::with_capacity(5);
             put_u32(&mut f, 1);
-            f.push(OP_PONG);
+            f.push(Op::Pong.code());
             out.write_all(&f)
         }
-        OP_INSERT => match do_insert(payload, db) {
+        Op::Insert => match do_insert(payload, db) {
             Ok(n) => reply_affected(out, n as u64),
             Err(e) => reply_error(out, &e),
         },
-        OP_UPSERT => match do_upsert(payload, db) {
+        Op::Upsert => match do_upsert(payload, db) {
             Ok(n) => reply_affected(out, n as u64),
             Err(e) => reply_error(out, &e),
         },
-        OP_EXEC => match do_exec(payload, db) {
+        Op::Exec => match do_exec(payload, db) {
             Ok(output) => reply_output(out, &output),
             Err(e) => reply_error(out, &e),
         },
-        other => reply_error(out, &format!("unknown opcode 0x{other:02x}")),
+        // Close is handled by the read loop, and a response opcode arriving as a
+        // request means the peer is confused about which end it is
+        Op::Close => Ok(()),
+        Op::Affected | Op::Documents | Op::Error | Op::Pong => {
+            reply_error(out, &format!("{opcode:?} is a response, not a request"))
+        }
     }
 }
 
@@ -246,22 +266,22 @@ fn do_exec(payload: &[u8], db: &Arc<Mutex<Database>>) -> Result<QueryOutput, Str
 
 /* ---------- replies ---------- */
 
-fn frame(opcode: u8, body: Vec<u8>) -> Vec<u8> {
+fn frame(opcode: Op, body: Vec<u8>) -> Vec<u8> {
     let mut f = Vec::with_capacity(body.len() + 5);
     put_u32(&mut f, (body.len() + 1) as u32);
-    f.push(opcode);
+    f.push(opcode.code());
     f.extend_from_slice(&body);
     f
 }
 
 fn reply_affected(out: &mut impl Write, n: u64) -> std::io::Result<()> {
-    out.write_all(&frame(OP_AFFECTED, n.to_le_bytes().to_vec()))
+    out.write_all(&frame(Op::Affected, n.to_le_bytes().to_vec()))
 }
 
 fn reply_error(out: &mut impl Write, msg: &str) -> std::io::Result<()> {
     let mut body = Vec::new();
     put_str(&mut body, msg);
-    out.write_all(&frame(OP_ERROR, body))
+    out.write_all(&frame(Op::Error, body))
 }
 
 fn reply_output(out: &mut impl Write, output: &QueryOutput) -> std::io::Result<()> {
@@ -273,7 +293,7 @@ fn reply_output(out: &mut impl Write, output: &QueryOutput) -> std::io::Result<(
             for d in docs {
                 put_document_body(&mut body, d);
             }
-            out.write_all(&frame(OP_DOCUMENTS, body))
+            out.write_all(&frame(Op::Documents, body))
         }
     }
 }
@@ -326,62 +346,71 @@ mod tests {
             Client { r: BufReader::new(s.try_clone().unwrap()), w: s }
         }
 
-        fn send(&mut self, opcode: u8, body: &[u8]) {
+        // for the one test that has to put a code on the wire that Op rejects
+        fn send_raw(&mut self, code: u8, body: &[u8]) {
             let mut f = Vec::new();
             put_u32(&mut f, (body.len() + 1) as u32);
-            f.push(opcode);
+            f.push(code);
+            f.extend_from_slice(body);
+            self.w.write_all(&f).unwrap();
+        }
+
+        fn send(&mut self, opcode: Op, body: &[u8]) {
+            let mut f = Vec::new();
+            put_u32(&mut f, (body.len() + 1) as u32);
+            f.push(opcode.code());
             f.extend_from_slice(body);
             self.w.write_all(&f).unwrap();
         }
 
         /// (opcode, payload). None when the server closed the connection.
-        fn recv(&mut self) -> Option<(u8, Vec<u8>)> {
+        fn recv(&mut self) -> Option<(Op, Vec<u8>)> {
             let mut len = [0u8; 4];
             self.r.read_exact(&mut len).ok()?;
             let n = u32::from_le_bytes(len) as usize;
             let mut buf = vec![0u8; n];
             self.r.read_exact(&mut buf).ok()?;
-            Some((buf[0], buf[1..].to_vec()))
+            Some((Op::try_from(buf[0]).expect("server sent an unknown opcode"), buf[1..].to_vec()))
         }
 
-        fn exec(&mut self, source: &str) -> (u8, Vec<u8>) {
+        fn exec(&mut self, source: &str) -> (Op, Vec<u8>) {
             let mut body = Vec::new();
             put_str(&mut body, source);
-            self.send(OP_EXEC, &body);
+            self.send(Op::Exec, &body);
             self.recv().expect("server closed")
         }
 
-        fn insert(&mut self, collection: &str, docs: &[Document]) -> (u8, Vec<u8>) {
+        fn insert(&mut self, collection: &str, docs: &[Document]) -> (Op, Vec<u8>) {
             let mut body = Vec::new();
             put_str(&mut body, collection);
             put_u32(&mut body, docs.len() as u32);
             for d in docs {
                 put_document_body(&mut body, d);
             }
-            self.send(OP_INSERT, &body);
+            self.send(Op::Insert, &body);
             self.recv().expect("server closed")
         }
 
-        fn affected(&mut self, reply: (u8, Vec<u8>)) -> u64 {
+        fn affected(&mut self, reply: (Op, Vec<u8>)) -> u64 {
             let (op, payload) = reply;
-            assert_eq!(op, OP_AFFECTED, "expected affected, got {}", describe(op, &payload));
+            assert_eq!(op, Op::Affected, "expected affected, got {}", describe(op, &payload));
             u64::from_le_bytes(payload[..8].try_into().unwrap())
         }
 
-        fn documents(&mut self, reply: (u8, Vec<u8>)) -> Vec<Document> {
+        fn documents(&mut self, reply: (Op, Vec<u8>)) -> Vec<Document> {
             let (op, payload) = reply;
-            assert_eq!(op, OP_DOCUMENTS, "expected documents, got {}", describe(op, &payload));
+            assert_eq!(op, Op::Documents, "expected documents, got {}", describe(op, &payload));
             let mut r = Reader::new(&payload);
             let n = r.u32().unwrap() as usize;
             (0..n).map(|_| r.document_body().unwrap()).collect()
         }
     }
 
-    fn describe(op: u8, payload: &[u8]) -> String {
-        if op == OP_ERROR {
+    fn describe(op: Op, payload: &[u8]) -> String {
+        if op == Op::Error {
             format!("error: {}", Reader::new(payload).str().unwrap())
         } else {
-            format!("opcode 0x{op:02x}")
+            format!("{op:?}")
         }
     }
 
@@ -429,13 +458,13 @@ mod tests {
     fn test_ping_answers_pong() {
         let h = Harness::start("ping");
         let mut c = h.client();
-        c.send(OP_PING, &[]);
-        assert_eq!(c.recv().unwrap().0, OP_PONG);
+        c.send(Op::Ping, &[]);
+        assert_eq!(c.recv().unwrap().0, Op::Pong);
     }
 
     #[test]
     fn test_binary_insert_is_readable_by_asl() {
-        // the two paths are the same database: what OP_INSERT writes, a text
+        // the two paths are the same database: what Op::Insert writes, a text
         // query must find. This is the check that the fast path is a shortcut
         // and not a separate store.
         let h = Harness::start("insert");
@@ -488,7 +517,7 @@ mod tests {
             bodies.push(body);
         }
         for body in &bodies {
-            c.send(OP_INSERT, body);
+            c.send(Op::Insert, body);
         }
         for _ in 0..64 {
             let reply = c.recv().expect("server closed mid-pipeline");
@@ -508,7 +537,7 @@ mod tests {
         c.exec("create t {}");
 
         let (op, payload) = c.exec("this is not asl");
-        assert_eq!(op, OP_ERROR, "expected an error frame");
+        assert_eq!(op, Op::Error, "expected an error frame");
         assert!(!payload.is_empty());
 
         let reply = c.insert("t", &[doc("still-here")]);
@@ -519,12 +548,12 @@ mod tests {
     fn test_unknown_opcode_is_reported_not_fatal() {
         let h = Harness::start("opcode");
         let mut c = h.client();
-        c.send(0x7f, &[]);
+        c.send_raw(0x7f, &[]);
         let (op, payload) = c.recv().unwrap();
-        assert_eq!(op, OP_ERROR);
-        assert!(Reader::new(&payload).str().unwrap().contains("0x7f"));
-        c.send(OP_PING, &[]);
-        assert_eq!(c.recv().unwrap().0, OP_PONG);
+        assert_eq!(op, Op::Error);
+        assert!(Reader::new(&payload).str().unwrap().contains("127"));
+        c.send(Op::Ping, &[]);
+        assert_eq!(c.recv().unwrap().0, Op::Pong);
     }
 
     #[test]
@@ -532,15 +561,15 @@ mod tests {
         let h = Harness::start("missing");
         let mut c = h.client();
         let (op, _) = c.insert("nope", &[doc("x")]);
-        assert_eq!(op, OP_ERROR);
+        assert_eq!(op, Op::Error);
     }
 
     #[test]
     fn test_close_ends_the_connection() {
         let h = Harness::start("close");
         let mut c = h.client();
-        c.send(OP_CLOSE, &[]);
-        assert!(c.recv().is_none(), "OP_CLOSE should end the stream");
+        c.send(Op::Close, &[]);
+        assert!(c.recv().is_none(), "Op::Close should end the stream");
     }
 
     #[test]
@@ -551,7 +580,7 @@ mod tests {
         let mut c = h.client();
         c.w.write_all(&(u32::MAX).to_le_bytes()).unwrap();
         let (op, payload) = c.recv().unwrap();
-        assert_eq!(op, OP_ERROR);
+        assert_eq!(op, Op::Error);
         assert!(Reader::new(&payload).str().unwrap().contains("bad frame length"));
     }
 

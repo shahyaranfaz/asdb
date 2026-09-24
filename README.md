@@ -12,14 +12,14 @@ asdb implements its own page storage, buffer pool, slotted heap files, persisten
 - Fixed-size buffer pool with pinning, dirty tracking, and LRU-style eviction
 - Variable-length records in slotted heap pages
 - BSON-inspired documents with nested arrays and documents
-- Persistent collection and index catalog
+- Persistent collection and index catalog, spanning as many pages as it needs
 - B-tree point lookups, range scans, duplicate keys, splits, redistribution,
   merges, and deletion
-- Sort-preserving scalar index keys
+- Sort-preserving scalar index keys, with unique and composite-unique constraints
 - ASL lexer, parser, binder, planner, and lazy iterator-based executor
 - Filters, projection, ordering, pagination, aggregation, joins, and mutations
 - Minimal HTTP/1.1 interface returning JSON
-- Persistent ABP/1 connections with text-query and binary-document operations
+- Persistent ABP/1 connections with text-query, binary-document and keyed-upsert operations
 - Optional TTL policies with a background expiry sweeper
 - No runtime crate dependencies
 
@@ -100,8 +100,9 @@ Implemented operations include:
 - **Ordering and pagination:** multi-key order, offset, and limit
 - **Aggregation:** group, count, sum, average, min, max, and collect
 - **Joins:** inner hash joins
-- **Mutations:** insert, update, and delete
-- **DDL:** collections and single-field indexes
+- **Mutations:** insert, update, upsert, and delete
+- **DDL:** collections and indexes, with existence guards, unique constraints, and
+  composite unique indexes
 
 The complete language reference is in [asl.txt](asl.txt).
 

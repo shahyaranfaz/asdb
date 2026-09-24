@@ -83,10 +83,10 @@ impl Abp {
         }
     }
 
-    fn send(&mut self, opcode: u8, body: &[u8]) {
+    fn send(&mut self, opcode: Op, body: &[u8]) {
         let mut frame = Vec::with_capacity(body.len() + 5);
         put_u32(&mut frame, (body.len() + 1) as u32);
-        frame.push(opcode);
+        frame.push(opcode.code());
         frame.extend_from_slice(body);
         self.w.write_all(&frame).unwrap();
         self.w.flush().unwrap();
@@ -99,7 +99,7 @@ impl Abp {
         self.buf.clear();
         self.buf.resize(n, 0);
         self.r.read_exact(&mut self.buf).unwrap();
-        if self.buf[0] == OP_ERROR {
+        if self.buf[0] == Op::Error.code() {
             let msg = Reader::new(&self.buf[1..]).str().unwrap();
             panic!("server error: {msg}");
         }
@@ -109,7 +109,7 @@ impl Abp {
     fn exec(&mut self, source: &str) {
         let mut body = Vec::new();
         put_str(&mut body, source);
-        self.send(OP_EXEC, &body);
+        self.send(Op::Exec, &body);
         self.recv();
     }
 
@@ -120,7 +120,7 @@ impl Abp {
         for d in docs {
             put_document_body(&mut body, d);
         }
-        self.send(OP_INSERT, &body);
+        self.send(Op::Insert, &body);
         self.recv();
     }
 
@@ -143,7 +143,7 @@ impl Abp {
         for _ in 0..depth {
             let mut frame = Vec::with_capacity(body.len() + 5);
             put_u32(&mut frame, (body.len() + 1) as u32);
-            frame.push(OP_INSERT);
+            frame.push(Op::Insert.code());
             frame.extend_from_slice(&body);
             self.w.write_all(&frame).unwrap();
         }
@@ -154,7 +154,7 @@ impl Abp {
     }
 
     fn ping(&mut self) {
-        self.send(OP_PING, &[]);
+        self.send(Op::Ping, &[]);
         self.recv();
     }
 }

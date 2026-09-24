@@ -90,14 +90,23 @@ is little endian, so the conversion is a no-op.
 OPCODES
 
     requests                            responses
-    0x01  EXEC     ASL text             0x81  AFFECTED   u64
-    0x02  INSERT   binary documents     0x82  DOCUMENTS  u32 count + documents
-    0x03  PING                          0x83  ERROR      u32 len + UTF-8
-    0x04  CLOSE                         0x84  PONG
-    0x05  UPSERT   binary keyed write
+    1  EXEC     ASL text              6  AFFECTED   u64
+    2  INSERT   binary documents      7  DOCUMENTS  u32 count + documents
+    3  PING                           8  ERROR      u32 len + UTF-8
+    4  CLOSE                          9  PONG
+    5  UPSERT   binary keyed write
 
-The high bit marks a response, so a frame's direction is readable from one byte
-while debugging a hex dump.
+Opcodes are a small dense range rather than a bit-flagged one. They were 0x01
+and 0x81, with the high bit marking a response so direction was readable from a
+hex dump, but that bit made every response opcode negative as a Java byte and
+cost a cast at each one. Direction is unambiguous anyway: a client never sends
+AFFECTED and the server never sends INSERT.
+
+Both ends hold the codes as an enum rather than as loose constants, Op in
+src/wire.rs and AbpCodec.Op on the Java side. The byte is parsed once on read
+and written once on send, so an unknown code is answered with ERROR instead of
+travelling as a number nothing matches, and adding an opcode fails to compile
+until every match handles it.
 
     EXEC    [u32 len][ASL text]
     INSERT  [u32 len][collection][u32 count][document bodies]
